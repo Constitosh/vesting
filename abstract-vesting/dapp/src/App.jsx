@@ -83,7 +83,6 @@ async function mapLimit(arr, limit, fn) {
   return ret;
 }
 
-/* Force-ensure Abstract now (best-effort, safe to call anytime) */
 async function switchToAbstract() {
   const prov = AGW_ONLY();
   if (!prov) throw new Error('Abstract Wallet provider not found.');
@@ -95,7 +94,7 @@ async function switchToAbstract() {
    APP
    ========================= */
 export default function App(){
-  const { isConnected, address } = useAccount(); // wagmi still gives us the address
+  const { isConnected, address } = useAccount(); // wagmi gives current address
   const { logout } = useLoginWithAbstract();
   const isNarrow = useIsNarrow();
 
@@ -152,7 +151,6 @@ export default function App(){
           if (!a) { setSigner(null); setEthersProvider(null); }
         });
         prov.on?.('chainChanged', async ()=> {
-          // Always snap back to Abstract if something changes
           try { await ensureAbstractChain(prov); } catch {}
         });
       } catch (e) {
@@ -314,23 +312,31 @@ export default function App(){
   };
 
   const onLock = async () => {
-    if (!signer) return alert('Connect the Abstract Wallet first');
-    // Always ensure Abstract right before sending
-    try { await switchToAbstract(); } catch { return alert('Open with Abstract Wallet.'); }
+    // Re-hydrate provider/signer RIGHT NOW based on AGW, and ensure Abstract
+    let prov, s, bp, acc;
+    try {
+      prov = await switchToAbstract();
+      const wrap = await wrapEthers(prov);
+      bp = wrap.ethersProvider; s = wrap.signer; acc = wrap.account;
+      setEthersProvider(bp); setSigner(s); setAccount(acc);
+    } catch {
+      return alert('Connect the Abstract Wallet first');
+    }
 
     const tokenToUse = tokenAddr;
     if (!tokenToUse || tokenToUse.length !== 42) return alert('Choose a token (or paste a valid address).');
+    if (!amount || Number(amount) <= 0) return alert('Enter an amount to lock.');
 
     const erc20 = new Contract(tokenToUse, [
       'function allowance(address owner, address spender) view returns (uint256)',
       'function approve(address spender, uint256 value) returns (bool)'
-    ], ethersProvider);
+    ], bp);
 
     const amt = parseUnits((amount || '0').toString(), decimals);
     setPending(true);
     try {
       await ensureAllowance(erc20, amt);
-      const vestW = vest.connect(signer);
+      const vestW = vest.connect(s);
       const tx = await vestW.lock(tokenToUse, amt, days, { value: parseUnits(FIXED_FEE_ETH, 18) });
       setConfirmModal(false);
       await tx.wait();
@@ -342,11 +348,18 @@ export default function App(){
   };
 
   const withdraw = async (id) => {
-    if (!signer) return;
-    try { await switchToAbstract(); } catch { return alert('Open with Abstract Wallet.'); }
+    let prov, s, bp, acc;
+    try {
+      prov = await switchToAbstract();
+      const wrap = await wrapEthers(prov);
+      bp = wrap.ethersProvider; s = wrap.signer; acc = wrap.account;
+      setEthersProvider(bp); setSigner(s); setAccount(acc);
+    } catch {
+      return alert('Connect the Abstract Wallet first');
+    }
     setPending(true);
     try {
-      const vestW = vest.connect(signer);
+      const vestW = vest.connect(s);
       const tx = await vestW.withdraw(id);
       await tx.wait();
       setPositions(p => p.filter(x => x.id !== id));
