@@ -349,7 +349,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24}} className="muted">
-        <div>Made by <a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
+        <div>Made by<a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
       </div>
     </div>
   );
