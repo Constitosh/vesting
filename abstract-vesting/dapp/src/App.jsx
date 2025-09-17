@@ -1,12 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { BrowserProvider, Contract, formatUnits, parseUnits } from 'ethers';
-import { useAccount, useChainId } from 'wagmi';
+import { useAccount } from 'wagmi';
 import { useLoginWithAbstract } from '@abstract-foundation/agw-react';
 import AgwConnectButton from './components/AgwConnectButton.jsx';
 import abi from './abi/VestiLock.abi.json';
 
 /* =========================
-   CONFIG
+   CONFIG (Abstract only)
    ========================= */
 const CHAIN_ID = 2741; // Abstract mainnet
 const RPC_URL = 'https://api.mainnet.abs.xyz';
@@ -46,8 +46,6 @@ async function ensureAbstractChain(provider) {
       });
     }
   }
-  current = await provider.request({ method: 'eth_chainId' }).catch(() => null);
-  return current?.toLowerCase() === wantHex.toLowerCase();
 }
 
 async function wrapEthers(provider) {
@@ -85,12 +83,19 @@ async function mapLimit(arr, limit, fn) {
   return ret;
 }
 
+/* Force-ensure Abstract now (best-effort, safe to call anytime) */
+async function switchToAbstract() {
+  const prov = AGW_ONLY();
+  if (!prov) throw new Error('Abstract Wallet provider not found.');
+  await ensureAbstractChain(prov);
+  return prov;
+}
+
 /* =========================
    APP
    ========================= */
 export default function App(){
-  const { isConnected, address } = useAccount();
-  const connectedChainId = useChainId();
+  const { isConnected, address } = useAccount(); // wagmi still gives us the address
   const { logout } = useLoginWithAbstract();
   const isNarrow = useIsNarrow();
 
@@ -98,7 +103,6 @@ export default function App(){
   const [account, setAccount] = useState(null);
   const [ethersProvider, setEthersProvider] = useState(null);
   const [signer, setSigner] = useState(null);
-  const [networkOk, setNetworkOk] = useState(false);
 
   // Positions / UI
   const [positions, setPositions] = useState([]);
@@ -120,44 +124,40 @@ export default function App(){
   const [includeZero, setIncludeZero] = useState(false);
   const [lastErr, setLastErr] = useState(null);
 
-  // Contract
+  // Contract instance
   const vest = useMemo(() => {
     if (!ethersProvider) return null;
     return new Contract(CONTRACT_ADDRESS, abi, ethersProvider);
   }, [ethersProvider]);
 
-  /* Bind to AGW provider only */
+  /* Bind to AGW and force Abstract on connect */
   useEffect(() => {
     (async () => {
       if (!isConnected || !address) {
-        setAccount(null); setSigner(null); setEthersProvider(null); setNetworkOk(false);
+        setAccount(null); setSigner(null); setEthersProvider(null);
         return;
       }
-      const prov = AGW_ONLY();
-      if (!prov) {
-        console.warn('AGW provider not found.');
-        return;
-      }
-      try { await prov.request({ method: 'eth_requestAccounts' }); } catch {}
-      const ok = await ensureAbstractChain(prov);
-      const { ethersProvider, signer, account } = await wrapEthers(prov);
-      setNetworkOk(ok);
-      setAccount(account);
-      setSigner(signer);
-      setEthersProvider(ethersProvider);
+      try {
+        const prov = await switchToAbstract();
+        try { await prov.request({ method: 'eth_requestAccounts' }); } catch {}
+        const { ethersProvider, signer, account } = await wrapEthers(prov);
+        setAccount(account);
+        setSigner(signer);
+        setEthersProvider(ethersProvider);
 
-      // keep in sync
-      prov.on?.('accountsChanged', (accs)=> {
-        const a = accs?.[0];
-        setAccount(a || null);
-        if (!a) {
-          setSigner(null); setEthersProvider(null); setNetworkOk(false);
-        }
-      });
-      prov.on?.('chainChanged', async ()=> {
-        const ok2 = await ensureAbstractChain(prov);
-        setNetworkOk(ok2);
-      });
+        // keep in sync
+        prov.on?.('accountsChanged', (accs)=> {
+          const a = accs?.[0];
+          setAccount(a || null);
+          if (!a) { setSigner(null); setEthersProvider(null); }
+        });
+        prov.on?.('chainChanged', async ()=> {
+          // Always snap back to Abstract if something changes
+          try { await ensureAbstractChain(prov); } catch {}
+        });
+      } catch (e) {
+        console.warn('AGW/Abstract init:', e);
+      }
     })();
   }, [isConnected, address]);
 
@@ -190,7 +190,7 @@ export default function App(){
         }))
         .filter(t => includeZero ? true : t.balanceRaw > 0n);
 
-      const items = baseItems.slice(0, 150); // cap for UI
+      const items = baseItems.slice(0, 150);
       if (items.length === 0) {
         setDetected([]); setSelectedIdx(-1);
         return;
@@ -231,9 +231,8 @@ export default function App(){
         };
       };
 
-      // 3) Enrich each token (limit concurrency)
+      // 3) enrich
       const enriched = await mapLimit(items, 8, async (t) => {
-        // Dex first (symbol/logo), then Alchemy (decimals + fallback)
         let dex = null;
         try { dex = await fetchDexMeta(t.address); } catch {}
         let al = null;
@@ -307,7 +306,8 @@ export default function App(){
 
   /* Lock / Withdraw */
   const ensureAllowance = async (erc20, needed) => {
-    const allowance = await erc20.allowance((account || address), CONTRACT_ADDRESS);
+    const owner = (account || address);
+    const allowance = await erc20.allowance(owner, CONTRACT_ADDRESS);
     if (allowance >= needed) return;
     const tx = await erc20.connect(signer).approve(CONTRACT_ADDRESS, needed);
     await tx.wait();
@@ -315,7 +315,9 @@ export default function App(){
 
   const onLock = async () => {
     if (!signer) return alert('Connect the Abstract Wallet first');
-    if (connectedChainId !== CHAIN_ID) return alert('Switch to Abstract (2741) to lock.');
+    // Always ensure Abstract right before sending
+    try { await switchToAbstract(); } catch { return alert('Open with Abstract Wallet.'); }
+
     const tokenToUse = tokenAddr;
     if (!tokenToUse || tokenToUse.length !== 42) return alert('Choose a token (or paste a valid address).');
 
@@ -341,7 +343,7 @@ export default function App(){
 
   const withdraw = async (id) => {
     if (!signer) return;
-    if (connectedChainId !== CHAIN_ID) return alert('Switch to Abstract (2741) to withdraw.');
+    try { await switchToAbstract(); } catch { return alert('Open with Abstract Wallet.'); }
     setPending(true);
     try {
       const vestW = vest.connect(signer);
@@ -354,14 +356,11 @@ export default function App(){
   };
 
   const now = Math.floor(Date.now()/1000);
-  const isOnAbstract = connectedChainId === CHAIN_ID;
-
-  // responsive grid
   const gridStyle = isNarrow
     ? { display: 'grid', gridTemplateColumns: '1fr', gap: 20 }
     : { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 };
 
-  // Custom dropdown state
+  // Custom dropdown state (with logos)
   const [open, setOpen] = useState(false);
   const dropdownRef = useRef(null);
   useEffect(() => {
@@ -386,18 +385,17 @@ export default function App(){
         </div>
         <AgwConnectButton
           onConnected={async ()=> {
-            const prov = AGW_ONLY();
-            if (prov) {
-              const ok = await ensureAbstractChain(prov);
+            try {
+              const prov = await switchToAbstract();
               const { ethersProvider, signer, account } = await wrapEthers(prov);
-              setNetworkOk(ok); setAccount(account); setSigner(signer); setEthersProvider(ethersProvider);
-            } else {
-              alert('Abstract Wallet not detected in this browser. Please open with AGW.');
+              setAccount(account); setSigner(signer); setEthersProvider(ethersProvider);
+            } catch {
+              alert('Abstract Wallet not detected in this browser.');
             }
           }}
           onDisconnected={async ()=> {
             try { await logout?.(); } catch {}
-            setAccount(null); setSigner(null); setEthersProvider(null); setNetworkOk(false);
+            setAccount(null); setSigner(null); setEthersProvider(null);
             setDetected([]); setSelectedIdx(-1);
           }}
         />
@@ -405,9 +403,7 @@ export default function App(){
 
       {/* Status */}
       <div className="muted" style={{margin:'4px 4px 12px'}}>
-        acct: { (account || address) ? `${(account||address).slice(0,6)}…${(account||address).slice(-4)}` : '—' }
-        {' · '}
-        chain: {isOnAbstract ? '0xab5' : '— (need 0xab5)'}
+        acct: { (account || address) ? `${(account||address).slice(0,6)}…${(account||address).slice(-4)}` : '—' } · chain: 0xab5
       </div>
 
       {/* MAIN grid */}
@@ -522,10 +518,12 @@ export default function App(){
             <button
               className="btn btn-ghost"
               onClick={()=>setConfirmModal(true)}
-              disabled={!isConnected || connectedChainId !== CHAIN_ID || !networkOk || pending ||
-                        (tokenMode==='dropdown' && (selectedIdx<0 || !detected[selectedIdx])) ||
-                        (tokenMode==='custom' && (!tokenAddr || tokenAddr.length!==42)) ||
-                        !amount}
+              disabled={
+                !isConnected || pending ||
+                (tokenMode==='dropdown' && (selectedIdx<0 || !detected[selectedIdx])) ||
+                (tokenMode==='custom' && (!tokenAddr || tokenAddr.length!==42)) ||
+                !amount
+              }
             >
               LOCK TOKENS
             </button>
@@ -585,7 +583,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24}} className="muted">
-        <div>Network: Abstract (chainId 2741). Explorer: <a href="https://abscan.org/" target="_blank">abscan.org</a></div>
+ <div>Made by <a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
       </div>
     </div>
   );
