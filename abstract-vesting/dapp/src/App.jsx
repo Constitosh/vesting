@@ -56,17 +56,27 @@ async function toEthers(provider) {
   return { ethersProvider: bp, signer, account: accounts?.[0] || (await signer.getAddress()) };
 }
 
+// safe hex → BigInt
+function hexToBigIntSafe(h) {
+  try {
+    if (!h || h === '0x') return 0n;
+    return BigInt(h);
+  } catch {
+    return 0n;
+  }
+}
+
 // ====== component ======
 export default function App(){
-  // Wagmi connection state + AGW logout
   const { isConnected, address } = useAccount();
   const { logout } = useLoginWithAbstract();
 
-  // Local provider state for ethers
+  // Local provider state
   const [account, setAccount] = useState(null);
   const [ethersProvider, setEthersProvider] = useState(null);
   const [signer, setSigner] = useState(null);
   const [networkOk, setNetworkOk] = useState(false);
+  const [chainHex, setChainHex] = useState(null);
 
   // Positions / UI
   const [positions, setPositions] = useState([]);
@@ -81,10 +91,12 @@ export default function App(){
   const [amount, setAmount] = useState('');
   const [days, setDays] = useState(30);
 
-  // Detected token balances from Alchemy
+  // Detected token balances (Alchemy)
   const [detected, setDetected] = useState([]); // [{address,symbol,decimals,balanceRaw}]
   const [selectedIdx, setSelectedIdx] = useState(-1);
   const [loadingTokens, setLoadingTokens] = useState(false);
+  const [includeZero, setIncludeZero] = useState(false); // debug toggle
+  const [lastAlchemyErr, setLastAlchemyErr] = useState(null);
 
   // Contract instance
   const vest = useMemo(() => {
@@ -108,6 +120,9 @@ export default function App(){
       setSigner(signer);
       setEthersProvider(ethersProvider);
 
+      const cid = await agw.request({ method:'eth_chainId' }).catch(()=>null);
+      setChainHex(cid);
+
       // keep in sync
       agw.on?.('accountsChanged', (accs)=> {
         const a = accs?.[0];
@@ -116,88 +131,109 @@ export default function App(){
           setSigner(null); setEthersProvider(null); setNetworkOk(false);
         }
       });
-      agw.on?.('chainChanged', async ()=> {
+      agw.on?.('chainChanged', async (cidHex)=> {
+        setChainHex(cidHex);
         const ok2 = await ensureAbstractChain(agw);
         setNetworkOk(ok2);
       });
     })();
   }, [isConnected, address]);
 
-  // Fetch ERC-20 balances via Alchemy for dropdown
-  useEffect(() => {
-    (async () => {
-      if (!ethersProvider || !account) {
-        setDetected([]); setSelectedIdx(-1);
-        return;
-      }
-      setLoadingTokens(true);
-      try {
-        const body = {
-          id: 1,
-          jsonrpc: "2.0",
-          method: "alchemy_getTokenBalances",
-          params: [account, "erc20"]
-        };
-        const res = await fetch(ALCHEMY_URL, {
-          method: 'POST',
-          headers: { 'Accept':'application/json', 'Content-Type':'application/json' },
-          body: JSON.stringify(body)
-        });
-        const json = await res.json();
-        const balances = json?.result?.tokenBalances || [];
-
-        // Keep only non-zero balances
-        const nonZero = balances.filter(b => b.tokenBalance && b.tokenBalance !== '0x0');
-
-        // For each token, get symbol/decimals on-chain (fast, no extra API)
-        const erc20Meta = [
-          'function decimals() view returns (uint8)',
-          'function symbol() view returns (string)'
-        ];
-
-        // To avoid hammering the node if a wallet has lots of tokens, cap to first 100.
-        const slice = nonZero.slice(0, 100);
-
-        const enriched = await Promise.all(slice.map(async (row) => {
-          const address = row.contractAddress;
-          const balHex = row.tokenBalance; // hex string
-          const balanceRaw = BigInt(balHex);
-          try {
-            const c = new Contract(address, erc20Meta, ethersProvider);
-            const [d, s] = await Promise.all([
-              c.decimals().catch(()=>18),
-              c.symbol().catch(()=> 'TOK')
-            ]);
-            return { address, symbol: s, decimals: Number(d), balanceRaw };
-          } catch {
-            return { address, symbol: 'TOK', decimals: 18, balanceRaw };
-          }
-        }));
-
-        // Sort by balance desc for nicer UX
-        enriched.sort((a,b) => (b.balanceRaw * 10n) - (a.balanceRaw * 10n));
-
-        setDetected(enriched);
-        if (enriched.length) {
-          setTokenMode('dropdown');
-          setSelectedIdx(0);
-          setTokenAddr(enriched[0].address);
-          setSymbol(enriched[0].symbol);
-          setDecimals(enriched[0].decimals);
-        } else {
-          setSelectedIdx(-1);
-        }
-      } catch (e) {
-        console.error('Alchemy fetch error', e);
+  // Fetch ERC-20 balances via Alchemy → dropdown
+  const loadAlchemyTokens = async (addr) => {
+    setLoadingTokens(true);
+    setLastAlchemyErr(null);
+    try {
+      const body = {
+        id: 1,
+        jsonrpc: "2.0",
+        method: "alchemy_getTokenBalances",
+        params: [addr, "erc20"]
+      };
+      const res = await fetch(ALCHEMY_URL, {
+        method: 'POST',
+        headers: { 'Accept':'application/json', 'Content-Type':'application/json' },
+        body: JSON.stringify(body)
+      });
+      const json = await res.json();
+      if (!json?.result) {
         setDetected([]);
         setSelectedIdx(-1);
-      } finally {
-        setLoadingTokens(false);
+        setLastAlchemyErr(JSON.stringify(json));
+        return;
       }
-    })();
-  }, [ethersProvider, account]);
 
-  // Keep token meta in sync in custom mode
+      const balances = json.result.tokenBalances || [];
+      // Parse balances
+      let items = balances.map((row) => ({
+        address: row.contractAddress,
+        balanceRaw: hexToBigIntSafe(row.tokenBalance),
+        // temp placeholders, fill from chain next:
+        symbol: 'TOK', decimals: 18
+      }));
+
+      if (!includeZero) {
+        items = items.filter(t => t.balanceRaw > 0n);
+      }
+
+      // Early exit if nothing to show
+      if (items.length === 0) {
+        setDetected([]);
+        setSelectedIdx(-1);
+        return;
+      }
+
+      // Pull symbol/decimals from chain
+      const metaAbi = [
+        'function decimals() view returns (uint8)',
+        'function symbol() view returns (string)'
+      ];
+      const enriched = await Promise.all(items.slice(0, 250).map(async (t) => {
+        try {
+          const c = new Contract(t.address, metaAbi, ethersProvider);
+          const [d, s] = await Promise.all([
+            c.decimals().catch(()=>18),
+            c.symbol().catch(()=> 'TOK')
+          ]);
+          return { ...t, symbol: s, decimals: Number(d) };
+        } catch {
+          return t;
+        }
+      }));
+
+      // Sort by largest balance (approx)
+      enriched.sort((a,b) => (b.balanceRaw > a.balanceRaw ? 1 : -1));
+
+      setDetected(enriched);
+      if (enriched.length) {
+        setTokenMode('dropdown');
+        setSelectedIdx(0);
+        setTokenAddr(enriched[0].address);
+        setSymbol(enriched[0].symbol);
+        setDecimals(enriched[0].decimals);
+      } else {
+        setSelectedIdx(-1);
+      }
+    } catch (e) {
+      console.error('Alchemy fetch error', e);
+      setLastAlchemyErr(e?.message || String(e));
+      setDetected([]);
+      setSelectedIdx(-1);
+    } finally {
+      setLoadingTokens(false);
+    }
+  };
+
+  // Load once when we have a provider+account (and on includeZero toggle)
+  useEffect(() => {
+    if (!ethersProvider || !account) {
+      setDetected([]); setSelectedIdx(-1);
+      return;
+    }
+    loadAlchemyTokens(account);
+  }, [ethersProvider, account, includeZero]);
+
+  // Keep token meta in sync in custom mode or dropdown selection
   useEffect(() => {
     (async ()=>{
       if (!ethersProvider) return;
@@ -307,6 +343,9 @@ export default function App(){
               const ok = await ensureAbstractChain(agw);
               const { ethersProvider, signer, account } = await toEthers(agw);
               setNetworkOk(ok); setAccount(account); setSigner(signer); setEthersProvider(ethersProvider);
+              const cid = await agw.request({ method:'eth_chainId' }).catch(()=>null);
+              setChainHex(cid);
+              // initial token load happens via effect
             }
           }}
           onDisconnected={async ()=> {
@@ -315,6 +354,11 @@ export default function App(){
             setDetected([]); setSelectedIdx(-1);
           }}
         />
+      </div>
+
+      {/* Small debug line */}
+      <div className="muted" style={{margin:'4px 4px 12px'}}>
+        acct: {account ? `${account.slice(0,6)}…${account.slice(-4)}` : '—'} · chain: {chainHex || '—'} (need 0xab5)
       </div>
 
       {/* MAIN */}
@@ -326,7 +370,7 @@ export default function App(){
           <div className="hr" />
 
           {/* Token chooser */}
-          <div className="row" style={{gap:12}}>
+          <div className="row" style={{gap:12, alignItems:'end'}}>
             <div style={{flex: 1}}>
               <label>Token source</label>
               <select value={tokenMode} onChange={e=>setTokenMode(e.target.value)}>
@@ -336,20 +380,29 @@ export default function App(){
             </div>
 
             {tokenMode === 'dropdown' && (
-              <div style={{flex: 2}}>
-                <label>Choose token {loadingTokens && <span className="muted">(loading…)</span>}</label>
-                <select
-                  value={String(selectedIdx)}
-                  onChange={(e)=>setSelectedIdx(Number(e.target.value))}
-                >
-                  {(!loadingTokens && detected.length === 0) && <option value="-1">— none detected —</option>}
-                  {detected.map((t, i) => (
-                    <option key={t.address} value={String(i)}>
-                      {t.symbol} — {t.address.slice(0,6)}…{t.address.slice(-4)} ({formatUnits(t.balanceRaw, t.decimals)} {t.symbol})
-                    </option>
-                  ))}
-                </select>
-              </div>
+              <>
+                <div style={{flex: 2}}>
+                  <label>Choose token {loadingTokens && <span className="muted">(loading…)</span>}</label>
+                  <select
+                    value={String(selectedIdx)}
+                    onChange={(e)=>setSelectedIdx(Number(e.target.value))}
+                  >
+                    {(!loadingTokens && detected.length === 0) && <option value="-1">— none detected —</option>}
+                    {detected.map((t, i) => (
+                      <option key={t.address} value={String(i)}>
+                        {t.symbol} — {t.address.slice(0,6)}…{t.address.slice(-4)} ({formatUnits(t.balanceRaw, t.decimals)} {t.symbol})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="row" style={{gap:10}}>
+                  <button className="btn btn-ghost" onClick={()=>account && loadAlchemyTokens(account)} disabled={!account || loadingTokens}>Reload tokens</button>
+                  <label className="muted" style={{display:'flex', alignItems:'center', gap:6}}>
+                    <input type="checkbox" checked={includeZero} onChange={e=>setIncludeZero(e.target.checked)} />
+                    Include zero balances
+                  </label>
+                </div>
+              </>
             )}
 
             {tokenMode === 'custom' && (
@@ -359,6 +412,12 @@ export default function App(){
               </div>
             )}
           </div>
+
+          {lastAlchemyErr && (
+            <div className="muted" style={{marginTop:8, fontSize:12}}>
+              Alchemy note: {String(lastAlchemyErr).slice(0,220)}{String(lastAlchemyErr).length>220?'…':''}
+            </div>
+          )}
 
           {/* Amount + Duration */}
           <div className="row" style={{gap:12, marginTop:12}}>
