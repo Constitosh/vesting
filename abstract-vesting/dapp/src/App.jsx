@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { BrowserProvider, Contract, formatUnits, parseUnits } from 'ethers';
-import detectProvider from '@metamask/detect-provider';
 import abi from './abi/VestiLock.abi.json';
 
 // === CONFIG ===
@@ -11,8 +10,7 @@ const FIXED_FEE_ETH = '0.015';
 const CONTRACT_ADDRESS = import.meta.env.VITE_VESTI_ADDRESS || '0xYourDeployedContract';
 
 /* ---------------- helpers ---------------- */
-
-function hexChain(id){ return '0x' + Number(id).toString(16); }
+const hexChain = (id) => '0x' + Number(id).toString(16);
 
 async function ensureAbstractChain(provider, chainId = CHAIN_ID, rpcUrl = RPC_URL) {
   const wantHex = hexChain(chainId);
@@ -44,45 +42,17 @@ async function wrapEthersFrom(provider) {
   return { ethersProvider: bp, signer, account: accounts?.[0] || (await signer.getAddress()) };
 }
 
-// Try to find injected EIP-1193 providers, including AGW, MetaMask, Rabby, Phantom (EVM)
-async function discoverInjectedProviders() {
-  const out = [];
-
-  // New multi-injected standard (EIP-6963)
-  const addIfKnown = (prov) => {
-    try {
-      if (!prov) return;
-      if (prov.isRabby) out.push({ id: 'rabby', name: 'Rabby', provider: prov });
-      if (prov.isMetaMask) out.push({ id: 'metamask', name: 'MetaMask', provider: prov });
-      // Generic entry if neither flag present (could be AGW or other EVM wallet)
-      if (!prov.isRabby && !prov.isMetaMask) out.push({ id: 'injected', name: 'Injected Wallet', provider: prov });
-    } catch {}
-  };
-
-  const agg = window?.ethereum?.providers;
-  if (Array.isArray(agg)) agg.forEach(addIfKnown);
-  else addIfKnown(window?.ethereum);
-
-  // Phantom (EVM)
-  if (typeof window !== 'undefined' && window.phantom?.ethereum) {
-    out.push({ id: 'phantom', name: 'Phantom', provider: window.phantom.ethereum });
-  }
-
-  // Common AGW injections (covering current/older builds just in case)
-  if (window?.agw?.ethereum) out.push({ id: 'agw', name: 'Abstract Global Wallet', provider: window.agw.ethereum });
-  if (window?.abstract?.ethereum) out.push({ id: 'agw', name: 'Abstract Global Wallet', provider: window.abstract.ethereum });
-  if (window?.abstractWallet?.provider) out.push({ id: 'agw', name: 'Abstract Global Wallet', provider: window.abstractWallet.provider });
-
-  // Fallback MetaMask detect
-  try {
-    const mm = await detectProvider({ silent: true });
-    if (mm && !out.find(x => x.provider === mm)) addIfKnown(mm);
-  } catch {}
-
-  // Deduplicate by provider object
-  return out.filter((x, i, a) => a.findIndex(y => y.provider === x.provider) === i);
+// Try common AGW injections
+function getAgwProvider() {
+  if (typeof window === 'undefined') return null;
+  // Newer/older AGW builds may use different globals — try them all:
+  return (
+    window.agw?.ethereum ||
+    window.abstract?.ethereum ||
+    window.abstractWallet?.provider ||
+    null
+  );
 }
-
 /* --------------- component --------------- */
 
 export default function App(){
@@ -100,8 +70,6 @@ export default function App(){
   const [days, setDays] = useState(30);
   const [pending, setPending] = useState(false);
   const [confirmModal, setConfirmModal] = useState(false);
-  const [walletModal, setWalletModal] = useState(false);
-  const [providers, setProviders] = useState([]);
   const [positions, setPositions] = useState([]);
 
   // Build contract instance from current provider
@@ -110,37 +78,30 @@ export default function App(){
     return new Contract(CONTRACT_ADDRESS, abi, ethersProvider);
   }, [ethersProvider]);
 
-  // Populate wallet choices on first open
-  useEffect(() => {
-    if (!walletModal) return;
-    (async () => {
-      const list = await discoverInjectedProviders();
-      // Ensure we have at least a generic option if nothing detected
-      setProviders(list.length ? list : []);
-    })();
-  }, [walletModal]);
-
-  // Connect flows
-  const connectVia = async (entry) => {
+  // Connect AGW
+  const connectAGW = async () => {
     try {
-      if (!entry?.provider) throw new Error('No wallet provider found');
-      // Ask for accounts first; some wallets require it before chain methods
-      await entry.provider.request?.({ method: 'eth_requestAccounts' });
-      const ok = await ensureAbstractChain(entry.provider);
-      if (!ok) throw new Error('Failed to switch/add Abstract chain');
-      const { ethersProvider, signer, account } = await wrapEthersFrom(entry.provider);
+      const agw = getAgwProvider();
+      if (!agw) {
+        // No AGW injected — show install/open hint
+        window.open('https://build.abs.xyz/docs/authentication/connect-wallet-button', '_blank');
+        return;
+      }
+      await agw.request?.({ method: 'eth_requestAccounts' });
+      const ok = await ensureAbstractChain(agw);
+      if (!ok) throw new Error('Failed to switch/add Abstract');
+      const { ethersProvider, signer, account } = await wrapEthersFrom(agw);
       setAccount(account);
       setEthersProvider(ethersProvider);
       setSigner(signer);
       setNetworkOk(true);
-      setWalletModal(false);
     } catch (e) {
-      alert(e?.message || 'Wallet connect failed');
+      alert(e?.message || 'Abstract Wallet connect failed');
     }
   };
 
   const disconnect = () => {
-    // Injected wallets don’t have a programmatic disconnect. Clear local state.
+    // No programmatic disconnect; clear local state to “disconnect”
     setAccount(null);
     setSigner(null);
     setEthersProvider(null);
@@ -192,7 +153,7 @@ export default function App(){
   };
 
   const onLock = async () => {
-    if (!signer) return alert('Connect a wallet first');
+    if (!signer) return alert('Connect the Abstract Wallet first');
     const erc20 = new Contract(token, [
       'function allowance(address owner, address spender) view returns (uint256)',
       'function approve(address spender, uint256 value) returns (bool)'
@@ -233,7 +194,7 @@ export default function App(){
       <div className="nav">
         <div className="brand">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#62f3a7" strokeWidth="2"/><path d="M7 13l3 3 7-7" stroke="#62f3a7" strokeWidth="2"/></svg>
-          <span>tABS VestiLock</span>
+          <span>VestiLock</span>
           <span className="pill">Abstract · Mainnet</span>
         </div>
         <div className="row" style={{gap:8}}>
@@ -243,7 +204,7 @@ export default function App(){
               <button className="btn btn-ghost" onClick={disconnect}>Disconnect</button>
             </>
           ) : (
-            <button className="btn btn-accent" onClick={() => setWalletModal(true)}>Connect Wallet</button>
+            <button className="btn btn-accent" onClick={connectAGW}>Connect Abstract Wallet</button>
           )}
         </div>
       </div>
@@ -252,7 +213,7 @@ export default function App(){
         <div className="card">
           <h2>Lock Tokens</h2>
           <p className="muted">Lock ERC-20 tokens for a fixed time. Only the depositing wallet can withdraw after unlock.</p>
-          <div className="hr" />
+        <div className="hr" />
           <div>
             <label>Token address</label>
             <input placeholder="0x…" value={token} onChange={e=>setToken(e.target.value.trim())} />
@@ -308,25 +269,6 @@ export default function App(){
         </div>
       </div>
 
-      {/* Wallet picker */}
-      {walletModal && (
-        <div className="modal" onClick={()=>setWalletModal(false)}>
-          <div className="card" onClick={e=>e.stopPropagation()}>
-            <h3>Choose a wallet</h3>
-            <div className="hr" />
-            <div className="grid">
-              {providers.length === 0 && <div className="muted">No wallets detected in this browser.</div>}
-              {providers.map((p, i) => (
-                <button key={i} className="btn btn-ghost" onClick={()=>connectVia(p)}>{p.name}</button>
-              ))}
-            </div>
-            <p className="muted" style={{marginTop:12}}>
-              Supports injected wallets (MetaMask, Rabby, Phantom EVM, AGW if injected). We’ll auto-switch to Abstract (2741).
-            </p>
-          </div>
-        </div>
-      )}
-
       {/* Confirm modal */}
       {confirmModal && (
         <div className="modal" onClick={()=>!pending && setConfirmModal(false)}>
@@ -349,7 +291,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24}} className="muted">
-        <div>Made by<a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
+        <div>Network: Abstract (chainId 2741). Explorer: <a href="https://abscan.org/" target="_blank">abscan.org</a></div>
       </div>
     </div>
   );
