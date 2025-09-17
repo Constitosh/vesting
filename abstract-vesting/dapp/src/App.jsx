@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { BrowserProvider, Contract, formatUnits, parseUnits } from 'ethers';
-import { useAccount } from 'wagmi';
+import { useAccount, useChainId } from 'wagmi';
 import { useLoginWithAbstract } from '@abstract-foundation/agw-react';
 import AgwConnectButton from './components/AgwConnectButton.jsx';
 import abi from './abi/VestiLock.abi.json';
@@ -15,18 +15,13 @@ const ALCHEMY_URL = import.meta.env.VITE_ALCHEMY_URL || 'https://abstract-mainne
 
 // ====== helpers ======
 const hexChain = (id) => '0x' + Number(id).toString(16);
-
-function getInjectedProvider() {
-  if (typeof window === 'undefined') return null;
-  // Prefer AGW globals, fall back to standard EIP-1193
-  return (
-    window.agw?.ethereum ||
+const AGW_ONLY = () =>
+  (typeof window !== 'undefined') && (
     window.abstract?.ethereum ||
+    window.agw?.ethereum ||
     window.abstractWallet?.provider ||
-    window.ethereum || // <— important fallback
     null
   );
-}
 
 async function ensureAbstractChain(provider) {
   const wantHex = hexChain(CHAIN_ID);
@@ -51,7 +46,7 @@ async function ensureAbstractChain(provider) {
   return current?.toLowerCase() === wantHex.toLowerCase();
 }
 
-async function toEthers(provider) {
+async function wrapEthers(provider) {
   const bp = new BrowserProvider(provider);
   const signer = await bp.getSigner();
   const accounts = await provider.request({ method: 'eth_accounts' }).catch(() => []);
@@ -62,7 +57,6 @@ function hexToBigIntSafe(h) {
   try { return (!h || h === '0x') ? 0n : BigInt(h); } catch { return 0n; }
 }
 
-// Simple responsive helper
 function useIsNarrow(bp = 920) {
   const [narrow, setNarrow] = useState(() => (typeof window !== 'undefined' ? window.innerWidth < bp : false));
   useEffect(() => {
@@ -76,6 +70,7 @@ function useIsNarrow(bp = 920) {
 // ====== component ======
 export default function App(){
   const { isConnected, address } = useAccount();
+  const connectedChainId = useChainId();          // wagmi source of truth
   const { logout } = useLoginWithAbstract();
   const isNarrow = useIsNarrow();
 
@@ -84,7 +79,6 @@ export default function App(){
   const [ethersProvider, setEthersProvider] = useState(null);
   const [signer, setSigner] = useState(null);
   const [networkOk, setNetworkOk] = useState(false);
-  const [chainHex, setChainHex] = useState(null);
 
   // Positions / UI
   const [positions, setPositions] = useState([]);
@@ -112,46 +106,43 @@ export default function App(){
     return new Contract(CONTRACT_ADDRESS, abi, ethersProvider);
   }, [ethersProvider]);
 
-  // Bind to injected provider once Wagmi says connected
+  // Bind to **AGW provider only** when wagmi shows connected
   useEffect(() => {
     (async () => {
       if (!isConnected || !address) {
-        setAccount(null); setSigner(null); setEthersProvider(null); setNetworkOk(false); setChainHex(null);
+        setAccount(null); setSigner(null); setEthersProvider(null); setNetworkOk(false);
         return;
       }
-      const prov = getInjectedProvider();
-      if (!prov) return;
-
-      // request accounts (some wallets need this before chain calls)
+      const prov = AGW_ONLY();
+      if (!prov) {
+        console.warn('AGW provider not found in window.* (abstract/agw)');
+        return;
+      }
       try { await prov.request({ method: 'eth_requestAccounts' }); } catch {}
-
       const ok = await ensureAbstractChain(prov);
-      const { ethersProvider, signer, account } = await toEthers(prov);
-      const cid = await prov.request({ method:'eth_chainId' }).catch(()=>null);
+      const { ethersProvider, signer, account } = await wrapEthers(prov);
 
       setNetworkOk(ok);
       setAccount(account);
       setSigner(signer);
       setEthersProvider(ethersProvider);
-      setChainHex(cid);
 
       // keep in sync
       prov.on?.('accountsChanged', (accs)=> {
         const a = accs?.[0];
         setAccount(a || null);
         if (!a) {
-          setSigner(null); setEthersProvider(null); setNetworkOk(false); setChainHex(null);
+          setSigner(null); setEthersProvider(null); setNetworkOk(false);
         }
       });
-      prov.on?.('chainChanged', async (cidHex)=> {
-        setChainHex(cidHex);
+      prov.on?.('chainChanged', async ()=> {
         const ok2 = await ensureAbstractChain(prov);
         setNetworkOk(ok2);
       });
     })();
   }, [isConnected, address]);
 
-  // Fetch ERC-20 balances via Alchemy for dropdown
+  // Fetch ERC-20 balances from Alchemy once we have AGW provider, account, and correct chain
   const loadAlchemyTokens = async (addr) => {
     setLoadingTokens(true);
     setLastAlchemyErr(null);
@@ -186,7 +177,7 @@ export default function App(){
       if (!includeZero) items = items.filter(t => t.balanceRaw > 0n);
       if (items.length === 0) { setDetected([]); setSelectedIdx(-1); return; }
 
-      // Enrich symbol/decimals from chain (cap to avoid overfetch)
+      // Enrich meta from chain
       const metaAbi = [
         'function decimals() view returns (uint8)',
         'function symbol() view returns (string)'
@@ -202,7 +193,6 @@ export default function App(){
         } catch { return t; }
       }));
 
-      // sort by balance desc
       enriched.sort((a,b) => (b.balanceRaw > a.balanceRaw ? 1 : -1));
       setDetected(enriched);
 
@@ -224,14 +214,15 @@ export default function App(){
     }
   };
 
-  // Load tokens when provider+account ready (and when includeZero toggles)
+  // Load tokens when everything is ready AND we are on Abstract mainnet
   useEffect(() => {
-    if (!ethersProvider || !account || !networkOk) {
+    const onAbstract = connectedChainId === CHAIN_ID;
+    if (!ethersProvider || !account || !networkOk || !onAbstract) {
       setDetected([]); setSelectedIdx(-1);
       return;
     }
     loadAlchemyTokens(account);
-  }, [ethersProvider, account, networkOk, includeZero]);
+  }, [ethersProvider, account, networkOk, includeZero, connectedChainId]);
 
   // Keep token meta when selection/custom changes
   useEffect(() => {
@@ -325,8 +316,9 @@ export default function App(){
   };
 
   const now = Math.floor(Date.now()/1000);
+  const isOnAbstract = connectedChainId === CHAIN_ID;
 
-  // --- styles for responsive ---
+  // responsive grid
   const gridStyle = isNarrow
     ? { display: 'grid', gridTemplateColumns: '1fr', gap: 20 }
     : { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 };
@@ -342,30 +334,31 @@ export default function App(){
         </div>
         <AgwConnectButton
           onConnected={async ()=> {
-            const prov = getInjectedProvider();
+            const prov = AGW_ONLY();
             if (prov) {
               const ok = await ensureAbstractChain(prov);
-              const { ethersProvider, signer, account } = await toEthers(prov);
-              const cid = await prov.request({ method:'eth_chainId' }).catch(()=>null);
-              setNetworkOk(ok); setAccount(account); setSigner(signer); setEthersProvider(ethersProvider); setChainHex(cid);
+              const { ethersProvider, signer, account } = await wrapEthers(prov);
+              setNetworkOk(ok); setAccount(account); setSigner(signer); setEthersProvider(ethersProvider);
+            } else {
+              alert('Abstract Wallet not detected in this browser. Please open with AGW.');
             }
           }}
           onDisconnected={async ()=> {
             try { await logout?.(); } catch {}
             setAccount(null); setSigner(null); setEthersProvider(null); setNetworkOk(false);
-            setDetected([]); setSelectedIdx(-1); setChainHex(null);
+            setDetected([]); setSelectedIdx(-1);
           }}
         />
       </div>
 
-      {/* Small debug line */}
+      {/* Status line */}
       <div className="muted" style={{margin:'4px 4px 12px'}}>
         acct: { (account || address) ? `${(account||address).slice(0,6)}…${(account||address).slice(-4)}` : '—' }
         {' · '}
-        chain: {chainHex || '—'} (need 0xab5)
+        chain: {isOnAbstract ? '0xab5' : '— (need 0xab5)'}
       </div>
 
-      {/* MAIN grid (responsive) */}
+      {/* MAIN grid */}
       <div style={gridStyle}>
         {/* Lock card */}
         <div className="card">
@@ -373,7 +366,6 @@ export default function App(){
           <p className="muted">Lock ERC-20 tokens for a fixed time. Only the depositing wallet can withdraw after unlock.</p>
           <div className="hr" />
 
-          {/* Token chooser */}
           <div className="row" style={{gap:12, alignItems:'end', flexWrap:'wrap'}}>
             <div style={{flex: '1 1 180px'}}>
               <label>Token source</label>
@@ -390,6 +382,7 @@ export default function App(){
                   <select
                     value={String(selectedIdx)}
                     onChange={(e)=>setSelectedIdx(Number(e.target.value))}
+                    disabled={!isOnAbstract}
                   >
                     {(!loadingTokens && detected.length === 0) && <option value="-1">— none detected —</option>}
                     {detected.map((t, i) => (
@@ -400,7 +393,7 @@ export default function App(){
                   </select>
                 </div>
                 <div className="row" style={{gap:10, flex: '1 1 220px'}}>
-                  <button className="btn btn-ghost" onClick={()=>account && loadAlchemyTokens(account)} disabled={!account || loadingTokens}>Reload tokens</button>
+                  <button className="btn btn-ghost" onClick={()=>account && loadAlchemyTokens(account)} disabled={!account || loadingTokens || !isOnAbstract}>Reload tokens</button>
                   <label className="muted" style={{display:'flex', alignItems:'center', gap:6}}>
                     <input type="checkbox" checked={includeZero} onChange={e=>setIncludeZero(e.target.checked)} />
                     Include zero balances
@@ -423,7 +416,6 @@ export default function App(){
             </div>
           )}
 
-          {/* Amount + Duration */}
           <div className="row" style={{gap:12, marginTop:12, flexWrap:'wrap'}}>
             <div style={{flex:'1 1 200px'}}>
               <label>Amount ({symbol})</label>
@@ -437,17 +429,16 @@ export default function App(){
             </div>
           </div>
 
-          {/* Warning */}
           <div className="warn" style={{marginTop:12}}>
             <strong>Heads-up:</strong> Include <span className="mono">{FIXED_FEE_ETH} ETH</span> with the lock tx.
-            Funds are escrowed in the contract; only the same wallet can withdraw. If you lose keys, funds are <strong>lost</strong>.
+            Funds are escrowed; only the same wallet can withdraw. If you lose keys, funds are <strong>lost</strong>.
           </div>
 
           <div style={{display:'flex', gap:10, marginTop:12}}>
             <button
               className="btn btn-ghost"
               onClick={()=>setConfirmModal(true)}
-              disabled={!isConnected || !networkOk || pending ||
+              disabled={!isConnected || !networkOk || !isOnAbstract || pending ||
                         (tokenMode==='dropdown' && (selectedIdx<0 || !detected[selectedIdx])) ||
                         (tokenMode==='custom' && (!tokenAddr || tokenAddr.length!==42)) ||
                         !amount}
@@ -509,9 +500,9 @@ export default function App(){
         </div>
       )}
 
-      {/* footer */}
       <div style={{marginTop:24}} className="muted">
- <div>Made by <a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>      </div>
+        <div>Network: Abstract (chainId 2741). Explorer: <a href="https://abscan.org/" target="_blank">abscan.org</a></div>
+      </div>
     </div>
   );
 }
