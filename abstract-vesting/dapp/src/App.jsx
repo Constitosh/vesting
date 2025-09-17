@@ -11,16 +11,7 @@ const RPC_URL = 'https://api.mainnet.abs.xyz';
 const DURATIONS = [30,60,90,120,180,210,240,270,300,330,360];
 const FIXED_FEE_ETH = '0.015';
 const CONTRACT_ADDRESS = import.meta.env.VITE_VESTI_ADDRESS || '0xYourDeployedContract';
-
-/**
- * Add the ERC-20s you want to surface (will be scanned for non-zero balances).
- * { address, symbol, decimals }
- */
-const KNOWN_TOKENS = [
-  // Example placeholders — replace with Abstract mainnet tokens you expect:
-  // { address: '0xA0b86991c6218b36c1d19d4a2e9eb0cE3606eB48', symbol: 'USDC', decimals: 6 },
-  // { address: '0xC02aaA39b223FE8D0a0e5C4F27eAD9083C756Cc2', symbol: 'WETH', decimals: 18 },
-];
+const ALCHEMY_URL = import.meta.env.VITE_ALCHEMY_URL || 'https://abstract-mainnet.g.alchemy.com/v2/M2JFR2r4147ajgncDt4xV';
 
 // ====== helpers ======
 const hexChain = (id) => '0x' + Number(id).toString(16);
@@ -67,7 +58,7 @@ async function toEthers(provider) {
 
 // ====== component ======
 export default function App(){
-  // Wagmi gives us connection status; we still use EIP-1193 for ethers.
+  // Wagmi connection state + AGW logout
   const { isConnected, address } = useAccount();
   const { logout } = useLoginWithAbstract();
 
@@ -90,9 +81,10 @@ export default function App(){
   const [amount, setAmount] = useState('');
   const [days, setDays] = useState(30);
 
-  // Detected token balances
+  // Detected token balances from Alchemy
   const [detected, setDetected] = useState([]); // [{address,symbol,decimals,balanceRaw}]
   const [selectedIdx, setSelectedIdx] = useState(-1);
+  const [loadingTokens, setLoadingTokens] = useState(false);
 
   // Contract instance
   const vest = useMemo(() => {
@@ -100,7 +92,7 @@ export default function App(){
     return new Contract(CONTRACT_ADDRESS, abi, ethersProvider);
   }, [ethersProvider]);
 
-  // When wagmi says "connected", bind to the injected AGW and ensure chain
+  // Bind to AGW on connect
   useEffect(() => {
     (async () => {
       if (!isConnected || !address) {
@@ -116,7 +108,7 @@ export default function App(){
       setSigner(signer);
       setEthersProvider(ethersProvider);
 
-      // keep in sync with wallet changes
+      // keep in sync
       agw.on?.('accountsChanged', (accs)=> {
         const a = accs?.[0];
         setAccount(a || null);
@@ -131,35 +123,76 @@ export default function App(){
     })();
   }, [isConnected, address]);
 
-  // Scan known tokens for non-zero balances
+  // Fetch ERC-20 balances via Alchemy for dropdown
   useEffect(() => {
     (async () => {
-      if (!ethersProvider || !account) return setDetected([]);
-      if (!KNOWN_TOKENS.length) return setDetected([]);
-      const erc20 = [
-        'function balanceOf(address) view returns (uint256)',
-        'function decimals() view returns (uint8)',
-        'function symbol() view returns (string)'
-      ];
-      const results = [];
-      for (const t of KNOWN_TOKENS) {
-        try {
-          const c = new Contract(t.address, erc20, ethersProvider);
-          const [bal, d, s] = await Promise.all([
-            c.balanceOf(account),
-            t.decimals ?? c.decimals().catch(()=>18),
-            t.symbol   ?? c.symbol().catch(()=> 'TOK'),
-          ]);
-          if (bal > 0n) results.push({ address: t.address, symbol: s, decimals: Number(d), balanceRaw: bal });
-        } catch {}
+      if (!ethersProvider || !account) {
+        setDetected([]); setSelectedIdx(-1);
+        return;
       }
-      setDetected(results);
-      if (results.length) {
-        setTokenMode('dropdown');
-        setSelectedIdx(0);
-        setTokenAddr(results[0].address);
-        setSymbol(results[0].symbol);
-        setDecimals(results[0].decimals);
+      setLoadingTokens(true);
+      try {
+        const body = {
+          id: 1,
+          jsonrpc: "2.0",
+          method: "alchemy_getTokenBalances",
+          params: [account, "erc20"]
+        };
+        const res = await fetch(ALCHEMY_URL, {
+          method: 'POST',
+          headers: { 'Accept':'application/json', 'Content-Type':'application/json' },
+          body: JSON.stringify(body)
+        });
+        const json = await res.json();
+        const balances = json?.result?.tokenBalances || [];
+
+        // Keep only non-zero balances
+        const nonZero = balances.filter(b => b.tokenBalance && b.tokenBalance !== '0x0');
+
+        // For each token, get symbol/decimals on-chain (fast, no extra API)
+        const erc20Meta = [
+          'function decimals() view returns (uint8)',
+          'function symbol() view returns (string)'
+        ];
+
+        // To avoid hammering the node if a wallet has lots of tokens, cap to first 100.
+        const slice = nonZero.slice(0, 100);
+
+        const enriched = await Promise.all(slice.map(async (row) => {
+          const address = row.contractAddress;
+          const balHex = row.tokenBalance; // hex string
+          const balanceRaw = BigInt(balHex);
+          try {
+            const c = new Contract(address, erc20Meta, ethersProvider);
+            const [d, s] = await Promise.all([
+              c.decimals().catch(()=>18),
+              c.symbol().catch(()=> 'TOK')
+            ]);
+            return { address, symbol: s, decimals: Number(d), balanceRaw };
+          } catch {
+            return { address, symbol: 'TOK', decimals: 18, balanceRaw };
+          }
+        }));
+
+        // Sort by balance desc for nicer UX
+        enriched.sort((a,b) => (b.balanceRaw * 10n) - (a.balanceRaw * 10n));
+
+        setDetected(enriched);
+        if (enriched.length) {
+          setTokenMode('dropdown');
+          setSelectedIdx(0);
+          setTokenAddr(enriched[0].address);
+          setSymbol(enriched[0].symbol);
+          setDecimals(enriched[0].decimals);
+        } else {
+          setSelectedIdx(-1);
+        }
+      } catch (e) {
+        console.error('Alchemy fetch error', e);
+        setDetected([]);
+        setSelectedIdx(-1);
+      } finally {
+        setLoadingTokens(false);
       }
     })();
   }, [ethersProvider, account]);
@@ -267,7 +300,6 @@ export default function App(){
           <span>The tABS VestiLock</span>
           <span className="pill">Abstract · Mainnet</span>
         </div>
-        {/* Official AGW connect chip with logo */}
         <AgwConnectButton
           onConnected={async ()=> {
             const agw = getAgwInjected();
@@ -280,6 +312,7 @@ export default function App(){
           onDisconnected={async ()=> {
             try { await logout?.(); } catch {}
             setAccount(null); setSigner(null); setEthersProvider(null); setNetworkOk(false);
+            setDetected([]); setSelectedIdx(-1);
           }}
         />
       </div>
@@ -297,18 +330,19 @@ export default function App(){
             <div style={{flex: 1}}>
               <label>Token source</label>
               <select value={tokenMode} onChange={e=>setTokenMode(e.target.value)}>
-                <option value="dropdown">My wallet tokens</option>
+                <option value="dropdown">My wallet tokens (Alchemy)</option>
                 <option value="custom">Custom token address…</option>
               </select>
             </div>
+
             {tokenMode === 'dropdown' && (
               <div style={{flex: 2}}>
-                <label>Choose token (non-zero balance)</label>
+                <label>Choose token {loadingTokens && <span className="muted">(loading…)</span>}</label>
                 <select
                   value={String(selectedIdx)}
                   onChange={(e)=>setSelectedIdx(Number(e.target.value))}
                 >
-                  {detected.length === 0 && <option value="-1">— none detected —</option>}
+                  {(!loadingTokens && detected.length === 0) && <option value="-1">— none detected —</option>}
                   {detected.map((t, i) => (
                     <option key={t.address} value={String(i)}>
                       {t.symbol} — {t.address.slice(0,6)}…{t.address.slice(-4)} ({formatUnits(t.balanceRaw, t.decimals)} {t.symbol})
@@ -317,6 +351,7 @@ export default function App(){
                 </select>
               </div>
             )}
+
             {tokenMode === 'custom' && (
               <div style={{flex: 2}}>
                 <label>Token address</label>
