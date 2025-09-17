@@ -233,7 +233,7 @@ export default function App(){
       <div className="nav">
         <div className="brand">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#62f3a7" strokeWidth="2"/><path d="M7 13l3 3 7-7" stroke="#62f3a7" strokeWidth="2"/></svg>
-          <span>VestiLock</span>
+          <span>tABS VestiLock</span>
           <span className="pill">Abstract · Mainnet</span>
         </div>
         <div className="row" style={{gap:8}}>
@@ -349,7 +349,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24}} className="muted">
-        <div>Network: Abstract (chainId 2741). Explorer: <a href="https://abscan.org/" target="_blank">abscan.org</a></div>
+        <div>Made by <a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
       </div>
     </div>
   );
