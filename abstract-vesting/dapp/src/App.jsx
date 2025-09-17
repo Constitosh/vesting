@@ -19,40 +19,64 @@ const ALCHEMY_URL = import.meta.env.VITE_ALCHEMY_URL || 'https://abstract-mainne
    HELPERS
    ========================= */
 const hexChain = (id) => '0x' + Number(id).toString(16);
-const AGW_ONLY = () =>
-  (typeof window !== 'undefined') && (
+const ABSTRACT_HEX = hexChain(CHAIN_ID);
+
+function getAgwProvider() {
+  if (typeof window === 'undefined') return null;
+  return (
     window.abstract?.ethereum ||
     window.agw?.ethereum ||
     window.abstractWallet?.provider ||
+    window.ethereum || // AGW also injects a standard provider
     null
   );
+}
 
 async function ensureAbstractChain(provider) {
-  const wantHex = hexChain(CHAIN_ID);
-  let current = await provider.request({ method: 'eth_chainId' }).catch(() => null);
-  if (!current || current.toLowerCase() !== wantHex.toLowerCase()) {
+  // Read current chain
+  const current = await provider.request({ method: 'eth_chainId' }).catch(() => null);
+  if (current && current.toLowerCase() === ABSTRACT_HEX) return true;
+  // Try switch, then add
+  try {
+    await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: ABSTRACT_HEX }] });
+    return true;
+  } catch {
     try {
-      await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: wantHex }] });
-    } catch {
       await provider.request({
         method: 'wallet_addEthereumChain',
         params: [{
-          chainId: wantHex,
+          chainId: ABSTRACT_HEX,
           chainName: 'Abstract',
           rpcUrls: [RPC_URL],
           nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
-          blockExplorerUrls: ['https://abscan.org/']
-        }]
+          blockExplorerUrls: ['https://abscan.org/'],
+        }],
       });
+      return true;
+    } catch {
+      return false;
     }
   }
 }
 
-async function wrapEthers(provider) {
-  const bp = new BrowserProvider(provider);
-  const signer = await bp.getSigner();
-  const accounts = await provider.request({ method: 'eth_accounts' }).catch(() => []);
-  return { ethersProvider: bp, signer, account: accounts?.[0] || (await signer.getAddress()) };
+async function getLiveSigner() {
+  const prov = getAgwProvider();
+  if (!prov) throw new Error('No injected wallet provider found (AGW).');
+
+  const ok = await ensureAbstractChain(prov);
+  if (!ok) throw new Error('Please open with Abstract Wallet on Abstract (2741).');
+
+  // Make sure we have an account
+  let accounts = await prov.request({ method: 'eth_accounts' }).catch(() => []);
+  if (!accounts || accounts.length === 0) {
+    accounts = await prov.request({ method: 'eth_requestAccounts' }).catch(() => []);
+  }
+  if (!accounts || accounts.length === 0) throw new Error('Wallet is not connected.');
+
+  const bp = new BrowserProvider(prov);
+  const signer = await bp.getSigner(); // corresponds to selected account
+  const account = await signer.getAddress();
+  return { provider: bp, signer, account };
 }
 
 function hexToBigIntSafe(h) {
@@ -83,22 +107,16 @@ async function mapLimit(arr, limit, fn) {
   return ret;
 }
 
-async function switchToAbstract() {
-  const prov = AGW_ONLY();
-  if (!prov) throw new Error('Abstract Wallet provider not found.');
-  await ensureAbstractChain(prov);
-  return prov;
-}
-
 /* =========================
    APP
    ========================= */
 export default function App(){
-  const { isConnected, address } = useAccount(); // wagmi gives current address
+  // wagmi still gives us an address quickly even if our own provider isn’t hydrated yet.
+  const { isConnected, address } = useAccount();
   const { logout } = useLoginWithAbstract();
   const isNarrow = useIsNarrow();
 
-  // Provider state
+  // Live provider state we keep for reads (we still re-hydrate on tx)
   const [account, setAccount] = useState(null);
   const [ethersProvider, setEthersProvider] = useState(null);
   const [signer, setSigner] = useState(null);
@@ -129,7 +147,7 @@ export default function App(){
     return new Contract(CONTRACT_ADDRESS, abi, ethersProvider);
   }, [ethersProvider]);
 
-  /* Bind to AGW and force Abstract on connect */
+  /* Hydrate once on connect (for reads, dropdown, etc.) */
   useEffect(() => {
     (async () => {
       if (!isConnected || !address) {
@@ -137,24 +155,24 @@ export default function App(){
         return;
       }
       try {
-        const prov = await switchToAbstract();
-        try { await prov.request({ method: 'eth_requestAccounts' }); } catch {}
-        const { ethersProvider, signer, account } = await wrapEthers(prov);
-        setAccount(account);
+        const { provider, signer, account } = await getLiveSigner();
+        setEthersProvider(provider);
         setSigner(signer);
-        setEthersProvider(ethersProvider);
+        setAccount(account);
 
-        // keep in sync
-        prov.on?.('accountsChanged', (accs)=> {
+        const prov = getAgwProvider();
+        prov?.on?.('accountsChanged', (accs)=> {
           const a = accs?.[0];
           setAccount(a || null);
           if (!a) { setSigner(null); setEthersProvider(null); }
         });
-        prov.on?.('chainChanged', async ()=> {
-          try { await ensureAbstractChain(prov); } catch {}
+        prov?.on?.('chainChanged', async ()=> {
+          // keep it on Abstract if something changed
+          await ensureAbstractChain(prov);
         });
       } catch (e) {
-        console.warn('AGW/Abstract init:', e);
+        // Don’t alert on mount; just let the connect button handle; UI still works for dropdown when you connect later
+        console.warn('Init signer failed:', e?.message || e);
       }
     })();
   }, [isConnected, address]);
@@ -186,10 +204,10 @@ export default function App(){
           address: r.contractAddress,
           balanceRaw: hexToBigIntSafe(r.tokenBalance || "0x0"),
         }))
-        .filter(t => includeZero ? true : t.balanceRaw > 0n);
+        .filter(t => includeZero ? true : t.balanceRaw > 0n)
+        .slice(0, 150);
 
-      const items = baseItems.slice(0, 150);
-      if (items.length === 0) {
+      if (baseItems.length === 0) {
         setDetected([]); setSelectedIdx(-1);
         return;
       }
@@ -230,7 +248,7 @@ export default function App(){
       };
 
       // 3) enrich
-      const enriched = await mapLimit(items, 8, async (t) => {
+      const enriched = await mapLimit(baseItems, 8, async (t) => {
         let dex = null;
         try { dex = await fetchDexMeta(t.address); } catch {}
         let al = null;
@@ -264,7 +282,7 @@ export default function App(){
     }
   }
 
-  /* Load tokens as soon as we know ANY address (wagmi or AGW) */
+  /* Load tokens when we know an address (wagmi or AGW) */
   useEffect(() => {
     const wal = account || address;
     if (!wal) { setDetected([]); setSelectedIdx(-1); return; }
@@ -284,7 +302,7 @@ export default function App(){
     }
   }, [tokenMode, selectedIdx, detected]);
 
-  /* Positions */
+  /* Positions (read-only; uses provider if present) */
   useEffect(() => {
     if (!vest || !(account || address)) return;
     const who = account || address;
@@ -302,41 +320,39 @@ export default function App(){
     })();
   }, [vest, account, address]);
 
-  /* Lock / Withdraw */
-  const ensureAllowance = async (erc20, needed) => {
-    const owner = (account || address);
+  /* Lock / Withdraw — always re-hydrate a fresh signer before tx */
+  const ensureAllowance = async (erc20, owner, needed) => {
     const allowance = await erc20.allowance(owner, CONTRACT_ADDRESS);
     if (allowance >= needed) return;
-    const tx = await erc20.connect(signer).approve(CONTRACT_ADDRESS, needed);
+    const tx = await erc20.approve(CONTRACT_ADDRESS, needed);
     await tx.wait();
   };
 
   const onLock = async () => {
-    // Re-hydrate provider/signer RIGHT NOW based on AGW, and ensure Abstract
-    let prov, s, bp, acc;
-    try {
-      prov = await switchToAbstract();
-      const wrap = await wrapEthers(prov);
-      bp = wrap.ethersProvider; s = wrap.signer; acc = wrap.account;
-      setEthersProvider(bp); setSigner(s); setAccount(acc);
-    } catch {
-      return alert('Connect the Abstract Wallet first');
-    }
+    // Build a fresh signer from the live injected provider
+    let live;
+    try { live = await getLiveSigner(); }
+    catch (e) { return alert(e?.message || 'Connect the Abstract Wallet first'); }
+
+    const { provider, signer, account } = live;
+    setEthersProvider(provider); setSigner(signer); setAccount(account);
 
     const tokenToUse = tokenAddr;
     if (!tokenToUse || tokenToUse.length !== 42) return alert('Choose a token (or paste a valid address).');
     if (!amount || Number(amount) <= 0) return alert('Enter an amount to lock.');
 
-    const erc20 = new Contract(tokenToUse, [
-      'function allowance(address owner, address spender) view returns (uint256)',
-      'function approve(address spender, uint256 value) returns (bool)'
-    ], bp);
-
     const amt = parseUnits((amount || '0').toString(), decimals);
+
     setPending(true);
     try {
-      await ensureAllowance(erc20, amt);
-      const vestW = vest.connect(s);
+      const erc20 = new Contract(tokenToUse, [
+        'function allowance(address owner, address spender) view returns (uint256)',
+        'function approve(address spender, uint256 value) returns (bool)'
+      ], signer);
+
+      await ensureAllowance(erc20, account, amt);
+
+      const vestW = new Contract(CONTRACT_ADDRESS, abi, signer);
       const tx = await vestW.lock(tokenToUse, amt, days, { value: parseUnits(FIXED_FEE_ETH, 18) });
       setConfirmModal(false);
       await tx.wait();
@@ -348,18 +364,14 @@ export default function App(){
   };
 
   const withdraw = async (id) => {
-    let prov, s, bp, acc;
-    try {
-      prov = await switchToAbstract();
-      const wrap = await wrapEthers(prov);
-      bp = wrap.ethersProvider; s = wrap.signer; acc = wrap.account;
-      setEthersProvider(bp); setSigner(s); setAccount(acc);
-    } catch {
-      return alert('Connect the Abstract Wallet first');
-    }
+    let live;
+    try { live = await getLiveSigner(); }
+    catch (e) { return alert(e?.message || 'Connect the Abstract Wallet first'); }
+
+    const { signer } = live;
     setPending(true);
     try {
-      const vestW = vest.connect(s);
+      const vestW = new Contract(CONTRACT_ADDRESS, abi, signer);
       const tx = await vestW.withdraw(id);
       await tx.wait();
       setPositions(p => p.filter(x => x.id !== id));
@@ -398,13 +410,11 @@ export default function App(){
         </div>
         <AgwConnectButton
           onConnected={async ()=> {
+            // hydrate once right after clicking connect
             try {
-              const prov = await switchToAbstract();
-              const { ethersProvider, signer, account } = await wrapEthers(prov);
-              setAccount(account); setSigner(signer); setEthersProvider(ethersProvider);
-            } catch {
-              alert('Abstract Wallet not detected in this browser.');
-            }
+              const { provider, signer, account } = await getLiveSigner();
+              setAccount(account); setSigner(signer); setEthersProvider(provider);
+            } catch {/* ignore, button will keep trying */}
           }}
           onDisconnected={async ()=> {
             try { await logout?.(); } catch {}
@@ -596,7 +606,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24}} className="muted">
- <div>Made by <a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
+        <div>Network: Abstract (chainId 2741). Explorer: <a href="https://abscan.org/" target="_blank">abscan.org</a></div>
       </div>
     </div>
   );
