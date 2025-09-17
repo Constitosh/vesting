@@ -3,14 +3,24 @@ import { BrowserProvider, Contract, formatUnits, parseUnits } from 'ethers';
 import { useLoginWithAbstract } from '@abstract-foundation/agw-react';
 import abi from './abi/VestiLock.abi.json';
 
-// === CONFIG ===
-const CHAIN_ID = 2741; // Abstract mainnet
+// ====== CONFIG ======
+const CHAIN_ID = 2741;
 const RPC_URL = 'https://api.mainnet.abs.xyz';
 const DURATIONS = [30,60,90,120,180,210,240,270,300,330,360];
 const FIXED_FEE_ETH = '0.015';
 const CONTRACT_ADDRESS = import.meta.env.VITE_VESTI_ADDRESS || '0xYourDeployedContract';
 
-// ---------- helpers ----------
+/**
+ * EDIT THIS LIST to include the ERC-20s you want to surface in the dropdown.
+ * Format: { address, symbol, decimals }
+ */
+const KNOWN_TOKENS = [
+  // Examples — replace with tokens you expect users to lock on Abstract:
+  // { address: '0xTokenAddress1', symbol: 'USDC', decimals: 6 },
+  // { address: '0xTokenAddress2', symbol: 'WETH', decimals: 18 },
+];
+
+// ====== helpers ======
 const hexChain = (id) => '0x' + Number(id).toString(16);
 
 function getAgwInjected() {
@@ -53,34 +63,42 @@ async function toEthers(provider) {
   return { ethersProvider: bp, signer, account: accounts?.[0] || (await signer.getAddress()) };
 }
 
-// ---------- component ----------
+// ====== component ======
 export default function App(){
-  const { login, logout } = useLoginWithAbstract(); // official AGW auth hook
+  // Wallet state
+  const { login, logout } = useLoginWithAbstract();   // official AGW login
   const [account, setAccount] = useState(null);
   const [ethersProvider, setEthersProvider] = useState(null);
   const [signer, setSigner] = useState(null);
   const [networkOk, setNetworkOk] = useState(false);
 
-  const [token, setToken] = useState('');
+  // UI state
+  const [positions, setPositions] = useState([]);
+  const [pending, setPending] = useState(false);
+  const [confirmModal, setConfirmModal] = useState(false);
+
+  // Token form state
+  const [tokenMode, setTokenMode] = useState('dropdown'); // 'dropdown' | 'custom'
+  const [tokenAddr, setTokenAddr] = useState('');
   const [decimals, setDecimals] = useState(18);
   const [symbol, setSymbol] = useState('TOK');
   const [amount, setAmount] = useState('');
   const [days, setDays] = useState(30);
-  const [pending, setPending] = useState(false);
-  const [confirmModal, setConfirmModal] = useState(false);
-  const [positions, setPositions] = useState([]);
 
-  // Contract instance
+  // Detected token balances
+  const [detected, setDetected] = useState([]); // [{address,symbol,decimals,balanceRaw}]
+  const [selectedIdx, setSelectedIdx] = useState(-1);
+
+  // Contract
   const vest = useMemo(() => {
     if (!ethersProvider) return null;
     return new Contract(CONTRACT_ADDRESS, abi, ethersProvider);
   }, [ethersProvider]);
 
-  // Connect via AGW button
+  // --- Connect (AGW official) ---
   const connectAGW = async () => {
     try {
-      await login(); // opens AGW modal (create/login). Official flow.  :contentReference[oaicite:5]{index=5}
-
+      await login(); // opens official AGW modal
       const agw = getAgwInjected();
       if (!agw) throw new Error('Abstract Wallet provider not found in this browser');
 
@@ -93,6 +111,19 @@ export default function App(){
       setEthersProvider(ethersProvider);
       setSigner(signer);
       setNetworkOk(true);
+
+      // subscribe to account changes and keep header state correct
+      agw.on?.('accountsChanged', (accs) => {
+        const a = accs?.[0];
+        setAccount(a || null);
+        if (!a) {
+          setSigner(null); setEthersProvider(null); setNetworkOk(false);
+        }
+      });
+      agw.on?.('chainChanged', async () => {
+        const ok2 = await ensureAbstractChain(agw);
+        setNetworkOk(ok2);
+      });
     } catch (e) {
       alert(e?.message || 'Abstract Wallet connect failed');
     }
@@ -105,27 +136,76 @@ export default function App(){
     setEthersProvider(null);
     setNetworkOk(false);
     setPositions([]);
+    setDetected([]);
+    setSelectedIdx(-1);
   };
 
-  // Token metadata
+  // --- Scan wallet for known tokens with non-zero balance ---
+  useEffect(() => {
+    (async () => {
+      if (!ethersProvider || !account) return setDetected([]);
+      if (!KNOWN_TOKENS.length) return setDetected([]); // nothing to scan
+      const erc20Iface = [
+        'function balanceOf(address) view returns (uint256)',
+        'function decimals() view returns (uint8)',
+        'function symbol() view returns (string)'
+      ];
+      const results = [];
+      for (const t of KNOWN_TOKENS) {
+        try {
+          const c = new Contract(t.address, erc20Iface, ethersProvider);
+          const [bal, d, s] = await Promise.all([
+            c.balanceOf(account),
+            t.decimals ?? c.decimals().catch(()=>18),
+            t.symbol   ?? c.symbol().catch(()=> 'TOK'),
+          ]);
+          if (bal > 0n) {
+            results.push({ address: t.address, symbol: s, decimals: Number(d), balanceRaw: bal });
+          }
+        } catch {}
+      }
+      setDetected(results);
+      // if something is found, preselect first
+      if (results.length) {
+        setTokenMode('dropdown');
+        setSelectedIdx(0);
+        setTokenAddr(results[0].address);
+        setSymbol(results[0].symbol);
+        setDecimals(results[0].decimals);
+      }
+    })();
+  }, [ethersProvider, account]);
+
+  // --- Keep token meta in sync when switching dropdown/custom ---
   useEffect(() => {
     (async ()=>{
-      if (!ethersProvider || !token || token.length !== 42) return;
-      try {
-        const erc20 = new Contract(token, [
-          'function decimals() view returns (uint8)',
-          'function symbol() view returns (string)'
-        ], ethersProvider);
-        const [d, s] = await Promise.all([
-          erc20.decimals().catch(()=>18),
-          erc20.symbol().catch(()=> 'TOK')
-        ]);
-        setDecimals(Number(d)); setSymbol(s);
-      } catch {}
+      if (!ethersProvider) return;
+      if (tokenMode === 'dropdown') {
+        if (selectedIdx < 0 || !detected[selectedIdx]) return;
+        const t = detected[selectedIdx];
+        setTokenAddr(t.address);
+        setSymbol(t.symbol);
+        setDecimals(t.decimals);
+        return;
+      }
+      // custom mode: pull decimals/symbol if address looks valid
+      if (tokenAddr && tokenAddr.length === 42) {
+        try {
+          const c = new Contract(tokenAddr, [
+            'function decimals() view returns (uint8)',
+            'function symbol() view returns (string)'
+          ], ethersProvider);
+          const [d, s] = await Promise.all([
+            c.decimals().catch(()=>18),
+            c.symbol().catch(()=> 'TOK')
+          ]);
+          setDecimals(Number(d)); setSymbol(s);
+        } catch { /* leave defaults */ }
+      }
     })();
-  }, [ethersProvider, token]);
+  }, [tokenMode, selectedIdx, tokenAddr, ethersProvider, detected]);
 
-  // Load recent positions by this account
+  // --- Load recent positions ---
   useEffect(() => {
     if (!vest || !account) return;
     const filter = vest.filters.Deposit(null, account);
@@ -142,7 +222,7 @@ export default function App(){
     })();
   }, [vest, account]);
 
-  // Ensure allowance then lock
+  // --- Lock / Withdraw ---
   const ensureAllowance = async (erc20, needed) => {
     const allowance = await erc20.allowance(account, CONTRACT_ADDRESS);
     if (allowance >= needed) return;
@@ -152,7 +232,11 @@ export default function App(){
 
   const onLock = async () => {
     if (!signer) return alert('Connect the Abstract Wallet first');
-    const erc20 = new Contract(token, [
+
+    const tokenToUse = tokenAddr;
+    if (!tokenToUse || tokenToUse.length !== 42) return alert('Choose a token (or paste a valid address).');
+
+    const erc20 = new Contract(tokenToUse, [
       'function allowance(address owner, address spender) view returns (uint256)',
       'function approve(address spender, uint256 value) returns (bool)'
     ], ethersProvider);
@@ -162,7 +246,7 @@ export default function App(){
     try {
       await ensureAllowance(erc20, amt);
       const vestW = vest.connect(signer);
-      const tx = await vestW.lock(token, amt, days, { value: parseUnits(FIXED_FEE_ETH, 18) });
+      const tx = await vestW.lock(tokenToUse, amt, days, { value: parseUnits(FIXED_FEE_ETH, 18) });
       setConfirmModal(false);
       await tx.wait();
     } catch (e) {
@@ -189,6 +273,7 @@ export default function App(){
 
   return (
     <div className="shell">
+      {/* NAV */}
       <div className="nav">
         <div className="brand">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#62f3a7" strokeWidth="2"/><path d="M7 13l3 3 7-7" stroke="#62f3a7" strokeWidth="2"/></svg>
@@ -198,24 +283,60 @@ export default function App(){
         <div className="row" style={{gap:8}}>
           {account ? (
             <>
-              <span className="pill mono">{account.slice(0,6)}…{account.slice(-4)}</span>
-              <button className="btn btn-ghost" onClick={disconnect}>Disconnect</button>
+              <span className="pill mono">AGW · {account.slice(0,6)}…{account.slice(-4)}</span>
+              <button className="btn btn-ghost" onClick={disconnect}>Sign out</button>
             </>
           ) : (
-            <button className="btn btn-accent" onClick={connectAGW}>Connect Abstract Wallet</button>
+            <button className="btn btn-accent" onClick={connectAGW}>
+              {/* Mimic the official label; the actual modal is the official AGW login */}
+              Connect Abstract Wallet
+            </button>
           )}
         </div>
       </div>
 
+      {/* MAIN */}
       <div className="grid">
+        {/* Lock card */}
         <div className="card">
           <h2>Lock Tokens</h2>
           <p className="muted">Lock ERC-20 tokens for a fixed time. Only the depositing wallet can withdraw after unlock.</p>
           <div className="hr" />
-          <div>
-            <label>Token address</label>
-            <input placeholder="0x…" value={token} onChange={e=>setToken(e.target.value.trim())} />
+
+          {/* Token chooser */}
+          <div className="row" style={{gap:12}}>
+            <div style={{flex: 1}}>
+              <label>Token source</label>
+              <select value={tokenMode} onChange={e=>setTokenMode(e.target.value)}>
+                <option value="dropdown">My wallet tokens</option>
+                <option value="custom">Custom token address…</option>
+              </select>
+            </div>
+            {tokenMode === 'dropdown' && (
+              <div style={{flex: 2}}>
+                <label>Choose token (non-zero balance)</label>
+                <select
+                  value={String(selectedIdx)}
+                  onChange={(e)=>setSelectedIdx(Number(e.target.value))}
+                >
+                  {detected.length === 0 && <option value="-1">— none detected —</option>}
+                  {detected.map((t, i) => (
+                    <option key={t.address} value={String(i)}>
+                      {t.symbol} — {t.address.slice(0,6)}…{t.address.slice(-4)} ({formatUnits(t.balanceRaw, t.decimals)} {t.symbol})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {tokenMode === 'custom' && (
+              <div style={{flex: 2}}>
+                <label>Token address</label>
+                <input placeholder="0x…" value={tokenAddr} onChange={e=>setTokenAddr(e.target.value.trim())} />
+              </div>
+            )}
           </div>
+
+          {/* Amount + Duration */}
           <div className="row" style={{gap:12, marginTop:12}}>
             <div style={{flex:1}}>
               <label>Amount ({symbol})</label>
@@ -228,15 +349,28 @@ export default function App(){
               </select>
             </div>
           </div>
+
+          {/* Warning */}
           <div className="warn" style={{marginTop:12}}>
-            <strong>Heads-up:</strong> You must include <span className="mono">{FIXED_FEE_ETH} ETH</span> with the lock transaction.
+            <strong>Heads-up:</strong> Include <span className="mono">{FIXED_FEE_ETH} ETH</span> with the lock transaction.
             Funds are escrowed in the contract; only the same wallet can withdraw. If you lose keys, funds are <strong>lost</strong>.
           </div>
+
           <div style={{display:'flex', gap:10, marginTop:12}}>
-            <button className="btn btn-ghost" onClick={()=>setConfirmModal(true)} disabled={!account || !networkOk || !token || !amount || pending}>LOCK TOKENS</button>
+            <button
+              className="btn btn-ghost"
+              onClick={()=>setConfirmModal(true)}
+              disabled={!account || !networkOk || pending ||
+                        (tokenMode==='dropdown' && (selectedIdx<0 || !detected[selectedIdx])) ||
+                        (tokenMode==='custom' && (!tokenAddr || tokenAddr.length!==42)) ||
+                        !amount}
+            >
+              LOCK TOKENS
+            </button>
           </div>
         </div>
 
+        {/* Positions */}
         <div className="card">
           <h2>Your Positions</h2>
           <p className="muted">Connect your wallet to view the last 20 locks you created.</p>
@@ -288,8 +422,9 @@ export default function App(){
         </div>
       )}
 
+      {/* footer */}
       <div style={{marginTop:24}} className="muted">
-        <div>Made by <a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
+         <div>Made by <a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
       </div>
     </div>
   );
