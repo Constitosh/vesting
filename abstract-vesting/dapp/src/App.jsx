@@ -5,7 +5,9 @@ import { useLoginWithAbstract } from '@abstract-foundation/agw-react';
 import AgwConnectButton from './components/AgwConnectButton.jsx';
 import abi from './abi/VestiLock.abi.json';
 
-// ====== CONFIG ======
+/* =========================
+   CONFIG
+   ========================= */
 const CHAIN_ID = 2741; // Abstract mainnet
 const RPC_URL = 'https://api.mainnet.abs.xyz';
 const DURATIONS = [30,60,90,120,180,210,240,270,300,330,360];
@@ -13,7 +15,9 @@ const FIXED_FEE_ETH = '0.015';
 const CONTRACT_ADDRESS = import.meta.env.VITE_VESTI_ADDRESS || '0xYourDeployedContract';
 const ALCHEMY_URL = import.meta.env.VITE_ALCHEMY_URL || 'https://abstract-mainnet.g.alchemy.com/v2/M2JFR2r4147ajgncDt4xV';
 
-// ====== helpers ======
+/* =========================
+   HELPERS
+   ========================= */
 const hexChain = (id) => '0x' + Number(id).toString(16);
 const AGW_ONLY = () =>
   (typeof window !== 'undefined') && (
@@ -67,14 +71,30 @@ function useIsNarrow(bp = 920) {
   return narrow;
 }
 
-// ====== component ======
+/* Small helper: throttle concurrent fetches to avoid hammering APIs */
+async function mapLimit(arr, limit, fn) {
+  const ret = [];
+  let i = 0;
+  const workers = Array(Math.min(limit, arr.length)).fill(0).map(async () => {
+    while (i < arr.length) {
+      const idx = i++;
+      ret[idx] = await fn(arr[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return ret;
+}
+
+/* =========================
+   APP
+   ========================= */
 export default function App(){
   const { isConnected, address } = useAccount();
-  const connectedChainId = useChainId();          // wagmi source of truth
+  const connectedChainId = useChainId();
   const { logout } = useLoginWithAbstract();
   const isNarrow = useIsNarrow();
 
-  // Local provider state
+  // Provider state
   const [account, setAccount] = useState(null);
   const [ethersProvider, setEthersProvider] = useState(null);
   const [signer, setSigner] = useState(null);
@@ -93,20 +113,20 @@ export default function App(){
   const [amount, setAmount] = useState('');
   const [days, setDays] = useState(30);
 
-  // Alchemy balances (with metadata)
-  const [detected, setDetected] = useState([]); // [{address,symbol,decimals,balanceRaw,name?,logo?}]
+  // Token list (Alchemy + DexScreener)
+  const [detected, setDetected] = useState([]); // [{address, balanceRaw, decimals, symbol, name?, logo?}]
   const [selectedIdx, setSelectedIdx] = useState(-1);
   const [loadingTokens, setLoadingTokens] = useState(false);
   const [includeZero, setIncludeZero] = useState(false);
-  const [lastAlchemyErr, setLastAlchemyErr] = useState(null);
+  const [lastErr, setLastErr] = useState(null);
 
-  // Contract instance
+  // Contract
   const vest = useMemo(() => {
     if (!ethersProvider) return null;
     return new Contract(CONTRACT_ADDRESS, abi, ethersProvider);
   }, [ethersProvider]);
 
-  // Bind to **AGW provider only** when wagmi shows connected
+  /* Bind to AGW provider only */
   useEffect(() => {
     (async () => {
       if (!isConnected || !address) {
@@ -115,7 +135,7 @@ export default function App(){
       }
       const prov = AGW_ONLY();
       if (!prov) {
-        console.warn('AGW provider not found in window.abstract/agw/abstractWallet');
+        console.warn('AGW provider not found.');
         return;
       }
       try { await prov.request({ method: 'eth_requestAccounts' }); } catch {}
@@ -141,12 +161,12 @@ export default function App(){
     })();
   }, [isConnected, address]);
 
-  // --- Alchemy: balances + metadata (no on-chain meta calls) ---
-  async function loadAlchemyTokensWithMeta(walletAddress) {
+  /* ===== Alchemy balances + DexScreener metadata ===== */
+  async function loadTokensFor(walletAddress) {
     setLoadingTokens(true);
-    setLastAlchemyErr(null);
+    setLastErr(null);
     try {
-      // 1) balances
+      // 1) balances from Alchemy
       const balancesBody = {
         id: 1, jsonrpc: "2.0", method: "alchemy_getTokenBalances",
         params: [walletAddress, "erc20"]
@@ -168,15 +188,15 @@ export default function App(){
           balanceRaw: hexToBigIntSafe(r.tokenBalance || "0x0"),
         }))
         .filter(t => includeZero ? true : t.balanceRaw > 0n)
-        .slice(0, 200);
+        .slice(0, 150); // cap for UI
 
       if (items.length === 0) {
         setDetected([]); setSelectedIdx(-1);
         return;
       }
 
-      // 3) metadata (Alchemy per-token)
-      const metaFor = async (ca) => {
+      // Helper: get metadata from Alchemy
+      const fetchAlchemyMeta = async (ca) => {
         const metaBody = {
           id: 1, jsonrpc: "2.0", method: "alchemy_getTokenMetadata",
           params: [ca],
@@ -196,17 +216,46 @@ export default function App(){
         };
       };
 
-      const enriched = [];
-      for (const t of items) {
-        try {
-          const m = await metaFor(t.address);
-          enriched.push({ ...t, ...m });
-        } catch {
-          enriched.push({ ...t, symbol: "TOK", decimals: 18 });
-        }
-      }
+      // Helper: DexScreener token endpoint (for logo/symbol)
+      const fetchDexMeta = async (ca) => {
+        const url = `https://api.dexscreener.com/tokens/v1/abstract/${ca}`;
+        const r = await fetch(url);
+        if (!r.ok) throw new Error('dexscreener ' + r.status);
+        const arr = await r.json(); // array (possibly empty)
+        const first = Array.isArray(arr) && arr.length ? arr[0] : null;
+        if (!first) return null;
+        const base = first.baseToken || {};
+        const info = first.info || {};
+        return {
+          symbol: base.symbol || null,
+          name: base.name || null,
+          logo: info.imageUrl || null,
+        };
+      };
 
-      // 4) sort desc by balance
+      // 3) Enrich each item with meta (DexScreener first, fallback to Alchemy)
+      const enriched = await mapLimit(items, 8, async (t) => {
+        try {
+          const dex = await fetchDexMeta(t.address).catch(()=>null);
+          let symbol = dex?.symbol || null;
+          let name = dex?.name || null;
+          let logo = dex?.logo || null;
+
+          // We still need decimals; get from Alchemy (and take symbol if missing)
+          const m = await fetchAlchemyMeta(t.address).catch(()=>({ symbol:'TOK', decimals:18 }));
+          const decimals = Number.isFinite(m.decimals) ? m.decimals : 18;
+          if (!symbol) symbol = m.symbol || 'TOK';
+          if (!name) name = m.name;
+          if (!logo) logo = m.logo || null;
+
+          return { ...t, symbol, name, logo, decimals };
+        } catch {
+          const m = await fetchAlchemyMeta(t.address).catch(()=>({ symbol:'TOK', decimals:18 }));
+          return { ...t, symbol: m.symbol || 'TOK', name: m.name, logo: m.logo || null, decimals: m.decimals || 18 };
+        }
+      });
+
+      // 4) sort by balance desc (approx)
       enriched.sort((a,b) => (b.balanceRaw > a.balanceRaw ? 1 : -1));
 
       setDetected(enriched);
@@ -220,50 +269,35 @@ export default function App(){
         setSelectedIdx(-1);
       }
     } catch (e) {
-      console.error("Alchemy fetch error", e);
-      setLastAlchemyErr(e?.message || String(e));
+      console.error(e);
+      setLastErr(e?.message || String(e));
       setDetected([]); setSelectedIdx(-1);
     } finally {
       setLoadingTokens(false);
     }
   }
 
-  // Load tokens as soon as we know the account (no chain requirement for reading via Alchemy)
+  /* Load tokens as soon as we know the account (no chain requirement to READ) */
   useEffect(() => {
     if (!account) { setDetected([]); setSelectedIdx(-1); return; }
-    loadAlchemyTokensWithMeta(account);
+    loadTokensFor(account);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [account, includeZero, ALCHEMY_URL]);
 
-  // Keep token meta when selection/custom changes (dropdown already has meta; custom fetch on-chain)
+  /* Keep token meta when selection/custom changes */
   useEffect(() => {
-    (async ()=>{
-      if (!ethersProvider) return;
-      if (tokenMode === 'dropdown') {
-        if (selectedIdx < 0 || !detected[selectedIdx]) return;
-        const t = detected[selectedIdx];
-        setTokenAddr(t.address);
-        setSymbol(t.symbol);
-        setDecimals(t.decimals);
-        return;
-      }
-      if (tokenAddr && tokenAddr.length === 42) {
-        try {
-          const c = new Contract(tokenAddr, [
-            'function decimals() view returns (uint8)',
-            'function symbol() view returns (string)'
-          ], ethersProvider);
-          const [d, s] = await Promise.all([
-            c.decimals().catch(()=>18),
-            c.symbol().catch(()=> 'TOK')
-          ]);
-          setDecimals(Number(d)); setSymbol(s);
-        } catch {}
-      }
-    })();
-  }, [tokenMode, selectedIdx, tokenAddr, ethersProvider, detected]);
+    if (tokenMode === 'dropdown') {
+      if (selectedIdx < 0 || !detected[selectedIdx]) return;
+      const t = detected[selectedIdx];
+      setTokenAddr(t.address);
+      setSymbol(t.symbol || 'TOK');
+      setDecimals(Number.isFinite(t.decimals) ? t.decimals : 18);
+      return;
+    }
+    // custom mode: leave as-is (user provides address; we fetch on-chain if needed later)
+  }, [tokenMode, selectedIdx, detected]);
 
-  // Load recent positions
+  /* Positions */
   useEffect(() => {
     if (!vest || !account) return;
     const filter = vest.filters.Deposit(null, account);
@@ -280,7 +314,7 @@ export default function App(){
     })();
   }, [vest, account]);
 
-  // Lock / Withdraw
+  /* Lock / Withdraw */
   const ensureAllowance = async (erc20, needed) => {
     const allowance = await erc20.allowance(account, CONTRACT_ADDRESS);
     if (allowance >= needed) return;
@@ -336,13 +370,16 @@ export default function App(){
     ? { display: 'grid', gridTemplateColumns: '1fr', gap: 20 }
     : { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 };
 
+  // selected token preview (logo + symbol)
+  const selected = (tokenMode === 'dropdown' && selectedIdx >= 0) ? detected[selectedIdx] : null;
+
   return (
     <div className="shell">
       {/* NAV */}
       <div className="nav">
         <div className="brand">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#62f3a7" strokeWidth="2"/><path d="M7 13l3 3 7-7" stroke="#62f3a7" strokeWidth="2"/></svg>
-          <span>The tABS VestiLock</span>
+        <span>The tABS VestiLock</span>
           <span className="pill">Abstract · Mainnet</span>
         </div>
         <AgwConnectButton
@@ -364,7 +401,7 @@ export default function App(){
         />
       </div>
 
-      {/* Status line */}
+      {/* Status */}
       <div className="muted" style={{margin:'4px 4px 12px'}}>
         acct: { (account || address) ? `${(account||address).slice(0,6)}…${(account||address).slice(-4)}` : '—' }
         {' · '}
@@ -383,14 +420,14 @@ export default function App(){
             <div style={{flex: '1 1 180px'}}>
               <label>Token source</label>
               <select value={tokenMode} onChange={e=>setTokenMode(e.target.value)}>
-                <option value="dropdown">My wallet tokens (Alchemy)</option>
+                <option value="dropdown">My wallet tokens</option>
                 <option value="custom">Custom token address…</option>
               </select>
             </div>
 
             {tokenMode === 'dropdown' && (
               <>
-                <div style={{flex: '2 1 260px'}}>
+                <div style={{flex: '2 1 320px'}}>
                   <label>Choose token {loadingTokens && <span className="muted">(loading…)</span>}</label>
                   <select
                     value={String(selectedIdx)}
@@ -399,32 +436,41 @@ export default function App(){
                     {(!loadingTokens && detected.length === 0) && <option value="-1">— none detected —</option>}
                     {detected.map((t, i) => (
                       <option key={t.address} value={String(i)}>
-                        {t.symbol} — {t.address.slice(0,6)}…{t.address.slice(-4)} ({formatUnits(t.balanceRaw, t.decimals)} {t.symbol})
+                        {t.symbol || 'TOK'} — {t.address.slice(0,6)}…{t.address.slice(-4)}
+                        {` (${formatUnits(t.balanceRaw, Number.isFinite(t.decimals)?t.decimals:18)} ${t.symbol || 'TOK'})`}
                       </option>
                     ))}
                   </select>
                 </div>
                 <div className="row" style={{gap:10, flex: '1 1 220px'}}>
-                  <button className="btn btn-ghost" onClick={()=>account && loadAlchemyTokensWithMeta(account)} disabled={!account || loadingTokens}>Reload tokens</button>
+                  <button className="btn btn-ghost" onClick={()=>account && loadTokensFor(account)} disabled={!account || loadingTokens}>Reload tokens</button>
                   <label className="muted" style={{display:'flex', alignItems:'center', gap:6}}>
                     <input type="checkbox" checked={includeZero} onChange={e=>setIncludeZero(e.target.checked)} />
-                    Include zero balances
+                    Include zero
                   </label>
+                </div>
+
+                {/* selected token preview with logo */}
+                <div style={{flex:'1 1 100%', display:'flex', alignItems:'center', gap:10, marginTop:8}}>
+                  {selected?.logo && <img src={selected.logo} alt="" width={20} height={20} style={{borderRadius:4}} />}
+                  <div className="muted" style={{fontSize:12}}>
+                    {selected ? `${selected.symbol || 'TOK'} • ${selected.name || ''}` : '—'}
+                  </div>
                 </div>
               </>
             )}
 
             {tokenMode === 'custom' && (
-              <div style={{flex: '2 1 260px'}}>
+              <div style={{flex: '2 1 320px'}}>
                 <label>Token address</label>
                 <input placeholder="0x…" value={tokenAddr} onChange={e=>setTokenAddr(e.target.value.trim())} />
               </div>
             )}
           </div>
 
-          {lastAlchemyErr && (
+          {lastErr && (
             <div className="muted" style={{marginTop:8, fontSize:12}}>
-              Alchemy note: {String(lastAlchemyErr).slice(0,220)}{String(lastAlchemyErr).length>220?'…':''}
+              Note: {String(lastErr).slice(0,220)}{String(lastErr).length>220?'…':''}
             </div>
           )}
 
@@ -513,7 +559,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24}} className="muted">
- <div>Made by <a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
+        <div>Network: Abstract (chainId 2741). Explorer: <a href="https://abscan.org/" target="_blank">abscan.org</a></div>
       </div>
     </div>
   );
