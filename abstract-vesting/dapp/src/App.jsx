@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { BrowserProvider, Contract, formatUnits, parseUnits } from 'ethers';
 import { useAccount, useChainId } from 'wagmi';
 import { useLoginWithAbstract } from '@abstract-foundation/agw-react';
@@ -71,13 +71,13 @@ function useIsNarrow(bp = 920) {
   return narrow;
 }
 
-/* Small helper: throttle concurrent fetches to avoid hammering APIs */
 async function mapLimit(arr, limit, fn) {
-  const ret = [];
+  const ret = new Array(arr.length);
   let i = 0;
   const workers = Array(Math.min(limit, arr.length)).fill(0).map(async () => {
-    while (i < arr.length) {
+    while (true) {
       const idx = i++;
+      if (idx >= arr.length) break;
       ret[idx] = await fn(arr[idx], idx);
     }
   });
@@ -173,6 +173,7 @@ export default function App(){
       };
       const balancesRes = await fetch(ALCHEMY_URL, {
         method: "POST",
+        mode: "cors",
         headers: { "Accept": "application/json", "Content-Type": "application/json" },
         body: JSON.stringify(balancesBody),
       });
@@ -182,32 +183,30 @@ export default function App(){
         : [];
 
       // 2) normalize + filter
-      const items = rows
+      const baseItems = rows
         .map(r => ({
           address: r.contractAddress,
           balanceRaw: hexToBigIntSafe(r.tokenBalance || "0x0"),
         }))
-        .filter(t => includeZero ? true : t.balanceRaw > 0n)
-        .slice(0, 150); // cap for UI
+        .filter(t => includeZero ? true : t.balanceRaw > 0n);
 
+      const items = baseItems.slice(0, 150); // cap for UI
       if (items.length === 0) {
         setDetected([]); setSelectedIdx(-1);
         return;
       }
 
-      // Helper: get metadata from Alchemy
+      // helpers
       const fetchAlchemyMeta = async (ca) => {
-        const metaBody = {
-          id: 1, jsonrpc: "2.0", method: "alchemy_getTokenMetadata",
-          params: [ca],
-        };
-        const metaRes = await fetch(ALCHEMY_URL, {
+        const metaBody = { id: 1, jsonrpc: "2.0", method: "alchemy_getTokenMetadata", params: [ca] };
+        const r = await fetch(ALCHEMY_URL, {
           method: "POST",
+          mode: "cors",
           headers: { "Accept": "application/json", "Content-Type": "application/json" },
           body: JSON.stringify(metaBody),
         });
-        const metaJson = await metaRes.json();
-        const m = metaJson?.result || {};
+        const j = await r.json();
+        const m = j?.result || {};
         return {
           symbol: typeof m.symbol === "string" && m.symbol.length ? m.symbol : "TOK",
           decimals: Number.isFinite(m.decimals) ? Number(m.decimals) : 18,
@@ -216,12 +215,11 @@ export default function App(){
         };
       };
 
-      // Helper: DexScreener token endpoint (for logo/symbol)
       const fetchDexMeta = async (ca) => {
         const url = `https://api.dexscreener.com/tokens/v1/abstract/${ca}`;
-        const r = await fetch(url);
-        if (!r.ok) throw new Error('dexscreener ' + r.status);
-        const arr = await r.json(); // array (possibly empty)
+        const r = await fetch(url, { mode: 'cors' });
+        if (!r.ok) return null;
+        const arr = await r.json();
         const first = Array.isArray(arr) && arr.length ? arr[0] : null;
         if (!first) return null;
         const base = first.baseToken || {};
@@ -233,38 +231,30 @@ export default function App(){
         };
       };
 
-      // 3) Enrich each item with meta (DexScreener first, fallback to Alchemy)
+      // 3) Enrich each token (limit concurrency)
       const enriched = await mapLimit(items, 8, async (t) => {
-        try {
-          const dex = await fetchDexMeta(t.address).catch(()=>null);
-          let symbol = dex?.symbol || null;
-          let name = dex?.name || null;
-          let logo = dex?.logo || null;
+        // Dex first (symbol/logo), then Alchemy (decimals + fallback)
+        let dex = null;
+        try { dex = await fetchDexMeta(t.address); } catch {}
+        let al = null;
+        try { al = await fetchAlchemyMeta(t.address); } catch {}
 
-          // We still need decimals; get from Alchemy (and take symbol if missing)
-          const m = await fetchAlchemyMeta(t.address).catch(()=>({ symbol:'TOK', decimals:18 }));
-          const decimals = Number.isFinite(m.decimals) ? m.decimals : 18;
-          if (!symbol) symbol = m.symbol || 'TOK';
-          if (!name) name = m.name;
-          if (!logo) logo = m.logo || null;
+        const symbol = (dex?.symbol || al?.symbol || 'TOK');
+        const name = (dex?.name || al?.name);
+        const logo = (dex?.logo || al?.logo || null);
+        const decimals = Number.isFinite(al?.decimals) ? al.decimals : 18;
 
-          return { ...t, symbol, name, logo, decimals };
-        } catch {
-          const m = await fetchAlchemyMeta(t.address).catch(()=>({ symbol:'TOK', decimals:18 }));
-          return { ...t, symbol: m.symbol || 'TOK', name: m.name, logo: m.logo || null, decimals: m.decimals || 18 };
-        }
+        return { ...t, symbol, name, logo, decimals };
       });
 
-      // 4) sort by balance desc (approx)
       enriched.sort((a,b) => (b.balanceRaw > a.balanceRaw ? 1 : -1));
-
       setDetected(enriched);
       if (enriched.length) {
         setTokenMode("dropdown");
         setSelectedIdx(0);
         setTokenAddr(enriched[0].address);
-        setSymbol(enriched[0].symbol);
-        setDecimals(enriched[0].decimals);
+        setSymbol(enriched[0].symbol || 'TOK');
+        setDecimals(Number.isFinite(enriched[0].decimals) ? enriched[0].decimals : 18);
       } else {
         setSelectedIdx(-1);
       }
@@ -277,12 +267,13 @@ export default function App(){
     }
   }
 
-  /* Load tokens as soon as we know the account (no chain requirement to READ) */
+  /* Load tokens as soon as we know ANY address (wagmi or AGW) */
   useEffect(() => {
-    if (!account) { setDetected([]); setSelectedIdx(-1); return; }
-    loadTokensFor(account);
+    const wal = account || address;
+    if (!wal) { setDetected([]); setSelectedIdx(-1); return; }
+    loadTokensFor(wal);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [account, includeZero, ALCHEMY_URL]);
+  }, [account, address, includeZero, ALCHEMY_URL]);
 
   /* Keep token meta when selection/custom changes */
   useEffect(() => {
@@ -294,13 +285,13 @@ export default function App(){
       setDecimals(Number.isFinite(t.decimals) ? t.decimals : 18);
       return;
     }
-    // custom mode: leave as-is (user provides address; we fetch on-chain if needed later)
   }, [tokenMode, selectedIdx, detected]);
 
   /* Positions */
   useEffect(() => {
-    if (!vest || !account) return;
-    const filter = vest.filters.Deposit(null, account);
+    if (!vest || !(account || address)) return;
+    const who = account || address;
+    const filter = vest.filters.Deposit(null, who);
     (async ()=>{
       try {
         const logs = await vest.queryFilter(filter, -50000, 'latest');
@@ -312,11 +303,11 @@ export default function App(){
         setPositions(items.reverse());
       } catch {}
     })();
-  }, [vest, account]);
+  }, [vest, account, address]);
 
   /* Lock / Withdraw */
   const ensureAllowance = async (erc20, needed) => {
-    const allowance = await erc20.allowance(account, CONTRACT_ADDRESS);
+    const allowance = await erc20.allowance((account || address), CONTRACT_ADDRESS);
     if (allowance >= needed) return;
     const tx = await erc20.connect(signer).approve(CONTRACT_ADDRESS, needed);
     await tx.wait();
@@ -370,7 +361,18 @@ export default function App(){
     ? { display: 'grid', gridTemplateColumns: '1fr', gap: 20 }
     : { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 };
 
-  // selected token preview (logo + symbol)
+  // Custom dropdown state
+  const [open, setOpen] = useState(false);
+  const dropdownRef = useRef(null);
+  useEffect(() => {
+    const onClick = (e) => {
+      if (!dropdownRef.current) return;
+      if (!dropdownRef.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener('click', onClick);
+    return () => document.removeEventListener('click', onClick);
+  }, []);
+
   const selected = (tokenMode === 'dropdown' && selectedIdx >= 0) ? detected[selectedIdx] : null;
 
   return (
@@ -379,7 +381,7 @@ export default function App(){
       <div className="nav">
         <div className="brand">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#62f3a7" strokeWidth="2"/><path d="M7 13l3 3 7-7" stroke="#62f3a7" strokeWidth="2"/></svg>
-        <span>The tABS VestiLock</span>
+          <span>The tABS VestiLock</span>
           <span className="pill">Abstract · Mainnet</span>
         </div>
         <AgwConnectButton
@@ -427,41 +429,65 @@ export default function App(){
 
             {tokenMode === 'dropdown' && (
               <>
-                <div style={{flex: '2 1 320px'}}>
+                {/* Custom dropdown with logos */}
+                <div style={{flex: '2 1 360px'}} ref={dropdownRef}>
                   <label>Choose token {loadingTokens && <span className="muted">(loading…)</span>}</label>
-                  <select
-                    value={String(selectedIdx)}
-                    onChange={(e)=>setSelectedIdx(Number(e.target.value))}
-                  >
-                    {(!loadingTokens && detected.length === 0) && <option value="-1">— none detected —</option>}
-                    {detected.map((t, i) => (
-                      <option key={t.address} value={String(i)}>
-                        {t.symbol || 'TOK'} — {t.address.slice(0,6)}…{t.address.slice(-4)}
-                        {` (${formatUnits(t.balanceRaw, Number.isFinite(t.decimals)?t.decimals:18)} ${t.symbol || 'TOK'})`}
-                      </option>
-                    ))}
-                  </select>
+                  <div className="dropdown">
+                    <button className="btn btn-ghost" style={{width:'100%', justifyContent:'space-between'}} onClick={()=>setOpen(v=>!v)}>
+                      <div style={{display:'flex', alignItems:'center', gap:8, overflow:'hidden'}}>
+                        {selected?.logo && <img src={selected.logo} alt="" width="20" height="20" style={{borderRadius:4, flex:'0 0 auto'}} />}
+                        <span className="mono" style={{whiteSpace:'nowrap', textOverflow:'ellipsis', overflow:'hidden'}}>
+                          {selected ? `${selected.symbol || 'TOK'} — ${selected.address.slice(0,6)}…${selected.address.slice(-4)}` : '— none detected —'}
+                        </span>
+                      </div>
+                      <span>▾</span>
+                    </button>
+                    {open && (
+                      <div className="dropdown-menu" style={{
+                        position:'absolute', zIndex:20, marginTop:6, width:'100%',
+                        background:'#0e1420', border:'1px solid #1b2430', borderRadius:10, maxHeight:320, overflowY:'auto', boxShadow:'0 10px 30px rgba(0,0,0,0.35)'
+                      }}>
+                        {(!loadingTokens && detected.length === 0) && (
+                          <div className="muted" style={{padding:12}}>— none detected —</div>
+                        )}
+                        {detected.map((t, i) => (
+                          <div
+                            key={t.address}
+                            className="dropdown-item"
+                            style={{display:'flex', alignItems:'center', gap:10, padding:'10px 12px', cursor:'pointer'}}
+                            onClick={() => { setSelectedIdx(i); setOpen(false); }}
+                          >
+                            {t.logo && <img src={t.logo} alt="" width="20" height="20" style={{borderRadius:4}} />}
+                            <div style={{display:'flex', flexDirection:'column', minWidth:0}}>
+                              <div style={{display:'flex', alignItems:'center', gap:8, minWidth:0}}>
+                                <span style={{fontWeight:600}}>{t.symbol || 'TOK'}</span>
+                                <span className="muted mono" style={{fontSize:12, whiteSpace:'nowrap'}}>
+                                  {t.address.slice(0,6)}…{t.address.slice(-4)}
+                                </span>
+                              </div>
+                              <div className="muted" style={{fontSize:12, whiteSpace:'nowrap'}}>
+                                {formatUnits(t.balanceRaw, Number.isFinite(t.decimals)?t.decimals:18)} {t.symbol || 'TOK'}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
+
                 <div className="row" style={{gap:10, flex: '1 1 220px'}}>
-                  <button className="btn btn-ghost" onClick={()=>account && loadTokensFor(account)} disabled={!account || loadingTokens}>Reload tokens</button>
+                  <button className="btn btn-ghost" onClick={()=> (account || address) && loadTokensFor(account || address)} disabled={!(account || address) || loadingTokens}>Reload tokens</button>
                   <label className="muted" style={{display:'flex', alignItems:'center', gap:6}}>
                     <input type="checkbox" checked={includeZero} onChange={e=>setIncludeZero(e.target.checked)} />
                     Include zero
                   </label>
                 </div>
-
-                {/* selected token preview with logo */}
-                <div style={{flex:'1 1 100%', display:'flex', alignItems:'center', gap:10, marginTop:8}}>
-                  {selected?.logo && <img src={selected.logo} alt="" width={20} height={20} style={{borderRadius:4}} />}
-                  <div className="muted" style={{fontSize:12}}>
-                    {selected ? `${selected.symbol || 'TOK'} • ${selected.name || ''}` : '—'}
-                  </div>
-                </div>
               </>
             )}
 
             {tokenMode === 'custom' && (
-              <div style={{flex: '2 1 320px'}}>
+              <div style={{flex: '2 1 360px'}}>
                 <label>Token address</label>
                 <input placeholder="0x…" value={tokenAddr} onChange={e=>setTokenAddr(e.target.value.trim())} />
               </div>
@@ -470,7 +496,7 @@ export default function App(){
 
           {lastErr && (
             <div className="muted" style={{marginTop:8, fontSize:12}}>
-              Note: {String(lastErr).slice(0,220)}{String(lastErr).length>220?'…':''}
+              Note: {String(lastErr).slice(0,260)}{String(lastErr).length>260?'…':''}
             </div>
           )}
 
