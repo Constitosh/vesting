@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VestiLock – Abstract</title>
+    <link rel="preconnect" href="https://fonts.gstatic.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    <style>
+      :root { --bg:#0b0d10; --card:#111418; --accent:#62f3a7; --text:#e8eef3; --muted:#9aa6b2; }
+      *{ box-sizing:border-box; }
+      body{ margin:0; font-family:Inter,system-ui,Segoe UI,Arial; background:radial-gradient(1000px 600px at 10% -10%, #122026, transparent), var(--bg); color:var(--text);}
+      a{ color:var(--accent); text-decoration:none }
+      .shell{ max-width:980px; margin:0 auto; padding:24px; }
+      .nav{ display:flex; justify-content:space-between; align-items:center; margin-bottom:24px; }
+      .brand{ display:flex; gap:10px; align-items:center; font-weight:800; letter-spacing:.5px; }
+      .card{ background:linear-gradient(180deg, #12161b, #0e1116); border:1px solid #1a222c; border-radius:16px; padding:20px; box-shadow:0 10px 30px rgba(0,0,0,.25);}
+      .grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:16px; }
+      .btn{ border:none; padding:12px 16px; border-radius:12px; font-weight:700; cursor:pointer; }
+      .btn-accent{ background:var(--accent); color:#0a0d0f; }
+      .btn-ghost{ background:#151a20; color:var(--text); border:1px solid #202833; }
+      .btn:disabled{ opacity:.5; cursor:not-allowed; }
+      input,select{ width:100%; padding:12px; border-radius:12px; border:1px solid #202833; background:#0e1318; color:var(--text); }
+      label{ font-size:12px; color:var(--muted); display:block; margin-bottom:6px; }
+      .muted{ color:var(--muted); }
+      .danger{ color:#ff8f8f; }
+      .row{ display:flex; gap:10px; align-items:center; }
+      .pill{ padding:8px 12px; border-radius:999px; border:1px solid #243041; background:#0e141b; color:var(--muted);}
+      .hr{ height:1px; background:#1b2430; margin:16px 0; }
+      .warn{ background:#1c140f; border:1px solid #3b261b; color:#ffcd94; padding:12px; border-radius:12px; }
+      .modal{ position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,.6); }
+      .modal>.card{ max-width:560px; width:90%; }
+      .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
