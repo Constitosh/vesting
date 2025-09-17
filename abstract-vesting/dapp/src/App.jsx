@@ -270,8 +270,7 @@ export default function App(){
             </div>
           </div>
           <div className="warn" style={{marginTop:12}}>
-            <strong>Heads-up:</strong> You must include <span className="mono">{FIXED_FEE_ETH} ETH</span> with the lock transaction.
-            Funds are escrowed in the contract; only the same wallet can withdraw. If you lose keys, funds are <strong>lost</strong>.
+            <strong>Heads-up:</strong> You must include <span className="mono">{FIXED_FEE_ETH} ETH</span> with the lock transaction. Funds are escrowed in the contract; only the same wallet can withdraw. If you lose keys, funds are <strong>lost</strong>.
           </div>
           <div style={{display:'flex', gap:10, marginTop:12}}>
             <button className="btn btn-ghost" onClick={()=>setModal(true)} disabled={!account || !networkOk || !token || !amount || pending}>LOCK TOKENS</button>
@@ -349,7 +348,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24}} className="muted">
-        <div>Made by<a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
+         <div>Made by<a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
       </div>
     </div>
   );
