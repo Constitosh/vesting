@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { BrowserProvider, Contract, formatUnits, parseUnits } from 'ethers';
+import { useLoginWithAbstract } from '@abstract-foundation/agw-react';
 import abi from './abi/VestiLock.abi.json';
 
 // === CONFIG ===
@@ -9,11 +10,21 @@ const DURATIONS = [30,60,90,120,180,210,240,270,300,330,360];
 const FIXED_FEE_ETH = '0.015';
 const CONTRACT_ADDRESS = import.meta.env.VITE_VESTI_ADDRESS || '0xYourDeployedContract';
 
-/* ---------------- helpers ---------------- */
+// ---------- helpers ----------
 const hexChain = (id) => '0x' + Number(id).toString(16);
 
-async function ensureAbstractChain(provider, chainId = CHAIN_ID, rpcUrl = RPC_URL) {
-  const wantHex = hexChain(chainId);
+function getAgwInjected() {
+  if (typeof window === 'undefined') return null;
+  return (
+    window.agw?.ethereum ||
+    window.abstract?.ethereum ||
+    window.abstractWallet?.provider ||
+    null
+  );
+}
+
+async function ensureAbstractChain(provider) {
+  const wantHex = hexChain(CHAIN_ID);
   let current = await provider.request({ method: 'eth_chainId' }).catch(() => null);
   if (!current || current.toLowerCase() !== wantHex.toLowerCase()) {
     try {
@@ -24,7 +35,7 @@ async function ensureAbstractChain(provider, chainId = CHAIN_ID, rpcUrl = RPC_UR
         params: [{
           chainId: wantHex,
           chainName: 'Abstract',
-          rpcUrls: [rpcUrl],
+          rpcUrls: [RPC_URL],
           nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
           blockExplorerUrls: ['https://abscan.org/']
         }]
@@ -35,34 +46,21 @@ async function ensureAbstractChain(provider, chainId = CHAIN_ID, rpcUrl = RPC_UR
   return current?.toLowerCase() === wantHex.toLowerCase();
 }
 
-async function wrapEthersFrom(provider) {
+async function toEthers(provider) {
   const bp = new BrowserProvider(provider);
   const signer = await bp.getSigner();
   const accounts = await provider.request({ method: 'eth_accounts' }).catch(() => []);
   return { ethersProvider: bp, signer, account: accounts?.[0] || (await signer.getAddress()) };
 }
 
-// Try common AGW injections
-function getAgwProvider() {
-  if (typeof window === 'undefined') return null;
-  // Newer/older AGW builds may use different globals — try them all:
-  return (
-    window.agw?.ethereum ||
-    window.abstract?.ethereum ||
-    window.abstractWallet?.provider ||
-    null
-  );
-}
-/* --------------- component --------------- */
-
+// ---------- component ----------
 export default function App(){
-  // Wallet connection state
+  const { login, logout } = useLoginWithAbstract(); // official AGW auth hook
   const [account, setAccount] = useState(null);
   const [ethersProvider, setEthersProvider] = useState(null);
   const [signer, setSigner] = useState(null);
   const [networkOk, setNetworkOk] = useState(false);
 
-  // UI state
   const [token, setToken] = useState('');
   const [decimals, setDecimals] = useState(18);
   const [symbol, setSymbol] = useState('TOK');
@@ -72,25 +70,25 @@ export default function App(){
   const [confirmModal, setConfirmModal] = useState(false);
   const [positions, setPositions] = useState([]);
 
-  // Build contract instance from current provider
+  // Contract instance
   const vest = useMemo(() => {
     if (!ethersProvider) return null;
     return new Contract(CONTRACT_ADDRESS, abi, ethersProvider);
   }, [ethersProvider]);
 
-  // Connect AGW
+  // Connect via AGW button
   const connectAGW = async () => {
     try {
-      const agw = getAgwProvider();
-      if (!agw) {
-        // No AGW injected — show install/open hint
-        window.open('https://build.abs.xyz/docs/authentication/connect-wallet-button', '_blank');
-        return;
-      }
+      await login(); // opens AGW modal (create/login). Official flow.  :contentReference[oaicite:5]{index=5}
+
+      const agw = getAgwInjected();
+      if (!agw) throw new Error('Abstract Wallet provider not found in this browser');
+
       await agw.request?.({ method: 'eth_requestAccounts' });
       const ok = await ensureAbstractChain(agw);
       if (!ok) throw new Error('Failed to switch/add Abstract');
-      const { ethersProvider, signer, account } = await wrapEthersFrom(agw);
+
+      const { ethersProvider, signer, account } = await toEthers(agw);
       setAccount(account);
       setEthersProvider(ethersProvider);
       setSigner(signer);
@@ -100,8 +98,8 @@ export default function App(){
     }
   };
 
-  const disconnect = () => {
-    // No programmatic disconnect; clear local state to “disconnect”
+  const disconnect = async () => {
+    try { await logout?.(); } catch {}
     setAccount(null);
     setSigner(null);
     setEthersProvider(null);
@@ -194,7 +192,7 @@ export default function App(){
       <div className="nav">
         <div className="brand">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#62f3a7" strokeWidth="2"/><path d="M7 13l3 3 7-7" stroke="#62f3a7" strokeWidth="2"/></svg>
-          <span>tABS VestiLock</span>
+          <span>The tABS VestiLock</span>
           <span className="pill">Abstract · Mainnet</span>
         </div>
         <div className="row" style={{gap:8}}>
@@ -213,7 +211,7 @@ export default function App(){
         <div className="card">
           <h2>Lock Tokens</h2>
           <p className="muted">Lock ERC-20 tokens for a fixed time. Only the depositing wallet can withdraw after unlock.</p>
-        <div className="hr" />
+          <div className="hr" />
           <div>
             <label>Token address</label>
             <input placeholder="0x…" value={token} onChange={e=>setToken(e.target.value.trim())} />
@@ -291,7 +289,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24}} className="muted">
-         <div>Made by<a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
+        <div>Made by <a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
       </div>
     </div>
   );
