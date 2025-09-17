@@ -6,7 +6,7 @@ import AgwConnectButton from './components/AgwConnectButton.jsx';
 import abi from './abi/VestiLock.abi.json';
 
 // ====== CONFIG ======
-const CHAIN_ID = 2741;
+const CHAIN_ID = 2741; // Abstract mainnet
 const RPC_URL = 'https://api.mainnet.abs.xyz';
 const DURATIONS = [30,60,90,120,180,210,240,270,300,330,360];
 const FIXED_FEE_ETH = '0.015';
@@ -16,12 +16,14 @@ const ALCHEMY_URL = import.meta.env.VITE_ALCHEMY_URL || 'https://abstract-mainne
 // ====== helpers ======
 const hexChain = (id) => '0x' + Number(id).toString(16);
 
-function getAgwInjected() {
+function getInjectedProvider() {
   if (typeof window === 'undefined') return null;
+  // Prefer AGW globals, fall back to standard EIP-1193
   return (
     window.agw?.ethereum ||
     window.abstract?.ethereum ||
     window.abstractWallet?.provider ||
+    window.ethereum || // <— important fallback
     null
   );
 }
@@ -56,20 +58,26 @@ async function toEthers(provider) {
   return { ethersProvider: bp, signer, account: accounts?.[0] || (await signer.getAddress()) };
 }
 
-// safe hex → BigInt
 function hexToBigIntSafe(h) {
-  try {
-    if (!h || h === '0x') return 0n;
-    return BigInt(h);
-  } catch {
-    return 0n;
-  }
+  try { return (!h || h === '0x') ? 0n : BigInt(h); } catch { return 0n; }
+}
+
+// Simple responsive helper
+function useIsNarrow(bp = 920) {
+  const [narrow, setNarrow] = useState(() => (typeof window !== 'undefined' ? window.innerWidth < bp : false));
+  useEffect(() => {
+    const onResize = () => setNarrow(window.innerWidth < bp);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [bp]);
+  return narrow;
 }
 
 // ====== component ======
 export default function App(){
   const { isConnected, address } = useAccount();
   const { logout } = useLoginWithAbstract();
+  const isNarrow = useIsNarrow();
 
   // Local provider state
   const [account, setAccount] = useState(null);
@@ -91,11 +99,11 @@ export default function App(){
   const [amount, setAmount] = useState('');
   const [days, setDays] = useState(30);
 
-  // Detected token balances (Alchemy)
+  // Alchemy balances
   const [detected, setDetected] = useState([]); // [{address,symbol,decimals,balanceRaw}]
   const [selectedIdx, setSelectedIdx] = useState(-1);
   const [loadingTokens, setLoadingTokens] = useState(false);
-  const [includeZero, setIncludeZero] = useState(false); // debug toggle
+  const [includeZero, setIncludeZero] = useState(false);
   const [lastAlchemyErr, setLastAlchemyErr] = useState(null);
 
   // Contract instance
@@ -104,42 +112,46 @@ export default function App(){
     return new Contract(CONTRACT_ADDRESS, abi, ethersProvider);
   }, [ethersProvider]);
 
-  // Bind to AGW on connect
+  // Bind to injected provider once Wagmi says connected
   useEffect(() => {
     (async () => {
       if (!isConnected || !address) {
-        setAccount(null); setSigner(null); setEthersProvider(null); setNetworkOk(false);
+        setAccount(null); setSigner(null); setEthersProvider(null); setNetworkOk(false); setChainHex(null);
         return;
       }
-      const agw = getAgwInjected();
-      if (!agw) return;
-      const ok = await ensureAbstractChain(agw);
-      const { ethersProvider, signer, account } = await toEthers(agw);
+      const prov = getInjectedProvider();
+      if (!prov) return;
+
+      // request accounts (some wallets need this before chain calls)
+      try { await prov.request({ method: 'eth_requestAccounts' }); } catch {}
+
+      const ok = await ensureAbstractChain(prov);
+      const { ethersProvider, signer, account } = await toEthers(prov);
+      const cid = await prov.request({ method:'eth_chainId' }).catch(()=>null);
+
       setNetworkOk(ok);
       setAccount(account);
       setSigner(signer);
       setEthersProvider(ethersProvider);
-
-      const cid = await agw.request({ method:'eth_chainId' }).catch(()=>null);
       setChainHex(cid);
 
       // keep in sync
-      agw.on?.('accountsChanged', (accs)=> {
+      prov.on?.('accountsChanged', (accs)=> {
         const a = accs?.[0];
         setAccount(a || null);
         if (!a) {
-          setSigner(null); setEthersProvider(null); setNetworkOk(false);
+          setSigner(null); setEthersProvider(null); setNetworkOk(false); setChainHex(null);
         }
       });
-      agw.on?.('chainChanged', async (cidHex)=> {
+      prov.on?.('chainChanged', async (cidHex)=> {
         setChainHex(cidHex);
-        const ok2 = await ensureAbstractChain(agw);
+        const ok2 = await ensureAbstractChain(prov);
         setNetworkOk(ok2);
       });
     })();
   }, [isConnected, address]);
 
-  // Fetch ERC-20 balances via Alchemy → dropdown
+  // Fetch ERC-20 balances via Alchemy for dropdown
   const loadAlchemyTokens = async (addr) => {
     setLoadingTokens(true);
     setLastAlchemyErr(null);
@@ -156,34 +168,25 @@ export default function App(){
         body: JSON.stringify(body)
       });
       const json = await res.json();
+
       if (!json?.result) {
-        setDetected([]);
-        setSelectedIdx(-1);
+        setDetected([]); setSelectedIdx(-1);
         setLastAlchemyErr(JSON.stringify(json));
         return;
       }
 
-      const balances = json.result.tokenBalances || [];
-      // Parse balances
+      const balances = Array.isArray(json.result.tokenBalances) ? json.result.tokenBalances : [];
       let items = balances.map((row) => ({
         address: row.contractAddress,
         balanceRaw: hexToBigIntSafe(row.tokenBalance),
-        // temp placeholders, fill from chain next:
-        symbol: 'TOK', decimals: 18
+        symbol: 'TOK',
+        decimals: 18
       }));
 
-      if (!includeZero) {
-        items = items.filter(t => t.balanceRaw > 0n);
-      }
+      if (!includeZero) items = items.filter(t => t.balanceRaw > 0n);
+      if (items.length === 0) { setDetected([]); setSelectedIdx(-1); return; }
 
-      // Early exit if nothing to show
-      if (items.length === 0) {
-        setDetected([]);
-        setSelectedIdx(-1);
-        return;
-      }
-
-      // Pull symbol/decimals from chain
+      // Enrich symbol/decimals from chain (cap to avoid overfetch)
       const metaAbi = [
         'function decimals() view returns (uint8)',
         'function symbol() view returns (string)'
@@ -196,15 +199,13 @@ export default function App(){
             c.symbol().catch(()=> 'TOK')
           ]);
           return { ...t, symbol: s, decimals: Number(d) };
-        } catch {
-          return t;
-        }
+        } catch { return t; }
       }));
 
-      // Sort by largest balance (approx)
+      // sort by balance desc
       enriched.sort((a,b) => (b.balanceRaw > a.balanceRaw ? 1 : -1));
-
       setDetected(enriched);
+
       if (enriched.length) {
         setTokenMode('dropdown');
         setSelectedIdx(0);
@@ -215,25 +216,24 @@ export default function App(){
         setSelectedIdx(-1);
       }
     } catch (e) {
-      console.error('Alchemy fetch error', e);
       setLastAlchemyErr(e?.message || String(e));
-      setDetected([]);
-      setSelectedIdx(-1);
+      setDetected([]); setSelectedIdx(-1);
+      console.error('Alchemy fetch error', e);
     } finally {
       setLoadingTokens(false);
     }
   };
 
-  // Load once when we have a provider+account (and on includeZero toggle)
+  // Load tokens when provider+account ready (and when includeZero toggles)
   useEffect(() => {
-    if (!ethersProvider || !account) {
+    if (!ethersProvider || !account || !networkOk) {
       setDetected([]); setSelectedIdx(-1);
       return;
     }
     loadAlchemyTokens(account);
-  }, [ethersProvider, account, includeZero]);
+  }, [ethersProvider, account, networkOk, includeZero]);
 
-  // Keep token meta in sync in custom mode or dropdown selection
+  // Keep token meta when selection/custom changes
   useEffect(() => {
     (async ()=>{
       if (!ethersProvider) return;
@@ -288,7 +288,6 @@ export default function App(){
 
   const onLock = async () => {
     if (!signer) return alert('Connect the Abstract Wallet first');
-
     const tokenToUse = tokenAddr;
     if (!tokenToUse || tokenToUse.length !== 42) return alert('Choose a token (or paste a valid address).');
 
@@ -327,6 +326,11 @@ export default function App(){
 
   const now = Math.floor(Date.now()/1000);
 
+  // --- styles for responsive ---
+  const gridStyle = isNarrow
+    ? { display: 'grid', gridTemplateColumns: '1fr', gap: 20 }
+    : { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 };
+
   return (
     <div className="shell">
       {/* NAV */}
@@ -338,31 +342,31 @@ export default function App(){
         </div>
         <AgwConnectButton
           onConnected={async ()=> {
-            const agw = getAgwInjected();
-            if (agw) {
-              const ok = await ensureAbstractChain(agw);
-              const { ethersProvider, signer, account } = await toEthers(agw);
-              setNetworkOk(ok); setAccount(account); setSigner(signer); setEthersProvider(ethersProvider);
-              const cid = await agw.request({ method:'eth_chainId' }).catch(()=>null);
-              setChainHex(cid);
-              // initial token load happens via effect
+            const prov = getInjectedProvider();
+            if (prov) {
+              const ok = await ensureAbstractChain(prov);
+              const { ethersProvider, signer, account } = await toEthers(prov);
+              const cid = await prov.request({ method:'eth_chainId' }).catch(()=>null);
+              setNetworkOk(ok); setAccount(account); setSigner(signer); setEthersProvider(ethersProvider); setChainHex(cid);
             }
           }}
           onDisconnected={async ()=> {
             try { await logout?.(); } catch {}
             setAccount(null); setSigner(null); setEthersProvider(null); setNetworkOk(false);
-            setDetected([]); setSelectedIdx(-1);
+            setDetected([]); setSelectedIdx(-1); setChainHex(null);
           }}
         />
       </div>
 
       {/* Small debug line */}
       <div className="muted" style={{margin:'4px 4px 12px'}}>
-        acct: {account ? `${account.slice(0,6)}…${account.slice(-4)}` : '—'} · chain: {chainHex || '—'} (need 0xab5)
+        acct: { (account || address) ? `${(account||address).slice(0,6)}…${(account||address).slice(-4)}` : '—' }
+        {' · '}
+        chain: {chainHex || '—'} (need 0xab5)
       </div>
 
-      {/* MAIN */}
-      <div className="grid">
+      {/* MAIN grid (responsive) */}
+      <div style={gridStyle}>
         {/* Lock card */}
         <div className="card">
           <h2>Lock Tokens</h2>
@@ -370,8 +374,8 @@ export default function App(){
           <div className="hr" />
 
           {/* Token chooser */}
-          <div className="row" style={{gap:12, alignItems:'end'}}>
-            <div style={{flex: 1}}>
+          <div className="row" style={{gap:12, alignItems:'end', flexWrap:'wrap'}}>
+            <div style={{flex: '1 1 180px'}}>
               <label>Token source</label>
               <select value={tokenMode} onChange={e=>setTokenMode(e.target.value)}>
                 <option value="dropdown">My wallet tokens (Alchemy)</option>
@@ -381,7 +385,7 @@ export default function App(){
 
             {tokenMode === 'dropdown' && (
               <>
-                <div style={{flex: 2}}>
+                <div style={{flex: '2 1 260px'}}>
                   <label>Choose token {loadingTokens && <span className="muted">(loading…)</span>}</label>
                   <select
                     value={String(selectedIdx)}
@@ -395,7 +399,7 @@ export default function App(){
                     ))}
                   </select>
                 </div>
-                <div className="row" style={{gap:10}}>
+                <div className="row" style={{gap:10, flex: '1 1 220px'}}>
                   <button className="btn btn-ghost" onClick={()=>account && loadAlchemyTokens(account)} disabled={!account || loadingTokens}>Reload tokens</button>
                   <label className="muted" style={{display:'flex', alignItems:'center', gap:6}}>
                     <input type="checkbox" checked={includeZero} onChange={e=>setIncludeZero(e.target.checked)} />
@@ -406,7 +410,7 @@ export default function App(){
             )}
 
             {tokenMode === 'custom' && (
-              <div style={{flex: 2}}>
+              <div style={{flex: '2 1 260px'}}>
                 <label>Token address</label>
                 <input placeholder="0x…" value={tokenAddr} onChange={e=>setTokenAddr(e.target.value.trim())} />
               </div>
@@ -420,12 +424,12 @@ export default function App(){
           )}
 
           {/* Amount + Duration */}
-          <div className="row" style={{gap:12, marginTop:12}}>
-            <div style={{flex:1}}>
+          <div className="row" style={{gap:12, marginTop:12, flexWrap:'wrap'}}>
+            <div style={{flex:'1 1 200px'}}>
               <label>Amount ({symbol})</label>
               <input type="number" min="0" step="any" value={amount} onChange={e=>setAmount(e.target.value)} />
             </div>
-            <div style={{flex:1}}>
+            <div style={{flex:'1 1 200px'}}>
               <label>Duration (days)</label>
               <select value={days} onChange={e=>setDays(Number(e.target.value))}>
                 {DURATIONS.map(d => <option key={d} value={d}>{d}</option>)}
@@ -458,14 +462,14 @@ export default function App(){
           <h2>Your Positions</h2>
           <p className="muted">Connect your wallet to view the last 20 locks you created.</p>
           <div className="hr" />
-          {(!account) && <div className="muted">Not connected.</div>}
-          {(account && positions.length===0) && <div className="muted">No recent positions found.</div>}
+          {(!(account || address)) && <div className="muted">Not connected.</div>}
+          {((account || address) && positions.length===0) && <div className="muted">No recent positions found.</div>}
           {positions.map((p) => {
             const left = Math.max(0, p.unlockAt - now);
             const ready = left === 0;
             return (
               <div key={p.id} style={{marginBottom:12, paddingBottom:12, borderBottom:'1px solid #1b2430'}}>
-                <div className="row" style={{justifyContent:'space-between'}}>
+                <div className="row" style={{justifyContent:'space-between', flexWrap:'wrap', gap:8}}>
                   <div>
                     <div className="mono">ID #{p.id}</div>
                     <div className="muted">Unlock {new Date(p.unlockAt*1000).toLocaleString()}</div>
