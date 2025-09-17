@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { BrowserProvider, Contract, Erc20, formatUnits, parseUnits } from 'ethers';
+import { BrowserProvider, Contract, formatUnits, parseUnits } from 'ethers';
+import detectProvider from '@metamask/detect-provider';
+import { useAgw, useAgwAccount } from '@abstract-foundation/agw-react';
 import abi from './abi/VestiLock.abi.json';
 
 // === CONFIG ===
@@ -7,28 +9,79 @@ const CHAIN_ID = 2741; // Abstract mainnet
 const RPC_URL = 'https://api.mainnet.abs.xyz';
 const DURATIONS = [30,60,90,120,180,210,240,270,300,330,360];
 const FIXED_FEE_ETH = '0.015';
-// put your deployed contract here after deploy
 const CONTRACT_ADDRESS = import.meta.env.VITE_VESTI_ADDRESS || '0xYourDeployedContract';
 
-function useProvider() {
-  const [provider, setProvider] = useState(null);
-  useEffect(() => {
-    // Prefer injected provider (AGW/MetaMask). Fallback to RPC for reads
-    if (window.ethereum) {
-      setProvider(new BrowserProvider(window.ethereum));
-    } else {
-      setProvider(new BrowserProvider(new (window.ethereum?.constructor || window.Web3Provider)({
-        request: async ({ method, params }) => fetch(RPC_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc:'2.0', id:1, method, params }) }).then(r=>r.json()).then(r=>r.result)
-      })));
-    }
-  }, []);
-  return provider;
+// ---------- helpers (self-contained) ----------
+async function discoverInjectedProviders() {
+  const out = [];
+
+  // Phantom (EVM)
+  if (typeof window !== 'undefined' && window.phantom?.ethereum) {
+    out.push({ id: 'phantom', name: 'Phantom', provider: window.phantom.ethereum });
+  }
+
+  // EIP-6963 multi-injected array
+  const addIfKnown = (prov) => {
+    try {
+      if (!prov) return;
+      if (prov.isRabby) out.push({ id: 'rabby', name: 'Rabby', provider: prov });
+      if (prov.isMetaMask) out.push({ id: 'metamask', name: 'MetaMask', provider: prov });
+    } catch {}
+  };
+
+  const agg = window?.ethereum?.providers;
+  if (Array.isArray(agg)) agg.forEach(addIfKnown);
+  else addIfKnown(window?.ethereum);
+
+  try {
+    const mm = await detectProvider({ silent: true });
+    if (mm && !out.find(x => x.provider === mm)) addIfKnown(mm);
+  } catch {}
+
+  // de-dup
+  return out.filter((x, i, a) => a.findIndex(y => y.provider === x.provider) === i);
 }
 
+async function ensureAbstractChain(provider, chainId = CHAIN_ID, rpcUrl = RPC_URL) {
+  const wantHex = '0x' + chainId.toString(16);
+  let current = await provider.request({ method: 'eth_chainId' }).catch(() => null);
+  if (!current || current.toLowerCase() !== wantHex.toLowerCase()) {
+    try {
+      await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: wantHex }] });
+    } catch {
+      await provider.request({
+        method: 'wallet_addEthereumChain',
+        params: [{
+          chainId: wantHex,
+          chainName: 'Abstract',
+          rpcUrls: [rpcUrl],
+          nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+          blockExplorerUrls: ['https://abscan.org/']
+        }]
+      });
+    }
+  }
+  current = await provider.request({ method: 'eth_chainId' });
+  return current?.toLowerCase() === wantHex.toLowerCase();
+}
+
+async function wrapEthersFrom(provider) {
+  const bp = new BrowserProvider(provider);
+  const signer = await bp.getSigner();
+  const accounts = await provider.request({ method: 'eth_accounts' }).catch(() => []);
+  return { ethersProvider: bp, signer, account: accounts?.[0] || (await signer.getAddress()) };
+}
+
+// ----------------------------------------------
+
 export default function App(){
-  const provider = useProvider();
+  // Wallet state
   const [account, setAccount] = useState(null);
+  const [ethersProvider, setEthersProvider] = useState(null);
+  const [signer, setSigner] = useState(null);
   const [networkOk, setNetworkOk] = useState(false);
+
+  // UI state
   const [token, setToken] = useState('');
   const [decimals, setDecimals] = useState(18);
   const [symbol, setSymbol] = useState('TOK');
@@ -36,54 +89,84 @@ export default function App(){
   const [days, setDays] = useState(30);
   const [pending, setPending] = useState(false);
   const [modal, setModal] = useState(false);
-  const [positions, setPositions] = useState([]); // simple cache of last deposits from logs
+  const [walletModal, setWalletModal] = useState(false);
+  const [positions, setPositions] = useState([]);
 
+  // AGW hooks
+  const agw = useAgw();
+  const { address: agwAddress } = useAgwAccount();
+
+  // Contract
   const vest = useMemo(() => {
-    if (!provider) return null;
-    return new Contract(CONTRACT_ADDRESS, abi, provider);
-  }, [provider]);
+    if (!ethersProvider) return null;
+    return new Contract(CONTRACT_ADDRESS, abi, ethersProvider);
+  }, [ethersProvider]);
 
-  // connect wallet
-  const connect = async () => {
-    const accs = await provider.send('eth_requestAccounts', []);
-    setAccount(accs[0]);
-    const { chainId } = await provider.getNetwork();
-    if (Number(chainId) !== CHAIN_ID) {
-      try {
-        await provider.send('wallet_addEthereumChain', [{
-          chainId: '0xAB5', // 2741
-          chainName: 'Abstract',
-          rpcUrls: [RPC_URL],
-          nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
-          blockExplorerUrls: ['https://abscan.org/']
-        }]);
-      } catch {}
+  // ---- Connect flows ----
+  const openWalletModal = () => setWalletModal(true);
+
+  const connectAGW = async () => {
+    try {
+      await agw.connect();                 // opens AGW flow
+      const eip1193 = await agw.getProvider(); // AGW provider
+      const ok = await ensureAbstractChain(eip1193);
+      if (!ok) throw new Error('Failed to switch/add Abstract');
+      const { ethersProvider, signer, account } = await wrapEthersFrom(eip1193);
+      setAccount(account);
+      setEthersProvider(ethersProvider);
+      setSigner(signer);
+      setNetworkOk(true);
+      setWalletModal(false);
+    } catch (e) {
+      alert(e?.message || 'AGW connect failed');
     }
-    const { chainId: c2 } = await provider.getNetwork();
-    setNetworkOk(Number(c2) === CHAIN_ID);
   };
 
-  // fetch token meta on address change
+  const connectInjected = async (id) => {
+    try {
+      const list = await discoverInjectedProviders();
+      const use = id ? list.find(x => x.id === id) : list[0];
+      if (!use) throw new Error('No injected wallet found');
+      const ok = await ensureAbstractChain(use.provider);
+      if (!ok) throw new Error('Failed to switch/add Abstract');
+      const { ethersProvider, signer, account } = await wrapEthersFrom(use.provider);
+      setAccount(account);
+      setEthersProvider(ethersProvider);
+      setSigner(signer);
+      setNetworkOk(true);
+      setWalletModal(false);
+    } catch (e) {
+      alert(e?.message || 'Connect failed');
+    }
+  };
+
+  const disconnect = async () => {
+    try { await agw.disconnect?.(); } catch {}
+    setAccount(null);
+    setSigner(null);
+    setEthersProvider(null);
+    setNetworkOk(false);
+  };
+
+  // ---- Token meta on address change ----
   useEffect(() => {
     (async ()=>{
-      if (!provider || !token || token.length !== 42) return;
+      if (!ethersProvider || !token || token.length !== 42) return;
       try {
         const erc20 = new Contract(token, [
           'function decimals() view returns (uint8)',
-          'function symbol() view returns (string)',
-          'function allowance(address owner, address spender) view returns (uint256)',
-          'function approve(address spender, uint256 value) returns (bool)'
-        ], provider);
+          'function symbol() view returns (string)'
+        ], ethersProvider);
         const [d, s] = await Promise.all([
           erc20.decimals().catch(()=>18),
           erc20.symbol().catch(()=> 'TOK')
         ]);
         setDecimals(Number(d)); setSymbol(s);
-      } catch (e){ console.warn(e); }
+      } catch {}
     })();
-  }, [provider, token]);
+  }, [ethersProvider, token]);
 
-  // read recent deposits by this account from logs (cheap index):
+  // ---- Load recent positions for connected account ----
   useEffect(() => {
     if (!vest || !account) return;
     const filter = vest.filters.Deposit(null, account);
@@ -96,39 +179,33 @@ export default function App(){
           return { id, token: pos.token, amount: pos.amount, unlockAt: Number(pos.unlockAt) };
         }));
         setPositions(items.reverse());
-      } catch(e){ /* ignore */ }
+      } catch {}
     })();
   }, [vest, account]);
 
-  const ensureAllowance = async (signer, erc20, needed) => {
-    const current = await erc20.allowance(account, CONTRACT_ADDRESS);
-    if (current >= needed) return;
+  // ---- Lock / Withdraw ----
+  const ensureAllowance = async (erc20, needed) => {
+    const allowance = await erc20.allowance(account, CONTRACT_ADDRESS);
+    if (allowance >= needed) return;
     const tx = await erc20.connect(signer).approve(CONTRACT_ADDRESS, needed);
     await tx.wait();
   };
 
   const onLock = async () => {
-    if (!provider || !account) return;
-    const signer = await provider.getSigner();
+    if (!signer) return alert('Connect a wallet first');
     const erc20 = new Contract(token, [
-      'function decimals() view returns (uint8)',
-      'function symbol() view returns (string)',
       'function allowance(address owner, address spender) view returns (uint256)',
       'function approve(address spender, uint256 value) returns (bool)'
-    ], provider);
+    ], ethersProvider);
 
-    const amt = parseUnits(amount, decimals);
+    const amt = parseUnits(amount || '0', decimals);
     setPending(true);
     try {
-      await ensureAllowance(signer, erc20, amt);
-
+      await ensureAllowance(erc20, amt);
       const vestW = vest.connect(signer);
       const tx = await vestW.lock(token, amt, days, { value: parseUnits(FIXED_FEE_ETH, 18) });
       setModal(false);
       await tx.wait();
-
-      // refresh
-      const id = (await vest.nextId())?.toString?.() || null; // will be next after deposit; optional
     } catch (e) {
       alert(e?.shortMessage || e?.message || 'Transaction failed');
     } finally {
@@ -137,14 +214,12 @@ export default function App(){
   };
 
   const withdraw = async (id) => {
-    if (!provider || !account) return;
+    if (!signer) return;
     setPending(true);
     try {
-      const signer = await provider.getSigner();
       const vestW = vest.connect(signer);
       const tx = await vestW.withdraw(id);
       await tx.wait();
-      // remove from UI
       setPositions(p => p.filter(x => x.id !== id));
     } catch (e) {
       alert(e?.shortMessage || e?.message || 'Withdraw failed');
@@ -161,11 +236,14 @@ export default function App(){
           <span>VestiLock</span>
           <span className="pill">Abstract · Mainnet</span>
         </div>
-        <div>
+        <div className="row" style={{gap:8}}>
           {account ? (
-            <span className="pill mono">{account.slice(0,6)}…{account.slice(-4)}</span>
+            <>
+              <span className="pill mono">{account.slice(0,6)}…{account.slice(-4)}</span>
+              <button className="btn btn-ghost" onClick={disconnect}>Disconnect</button>
+            </>
           ) : (
-            <button className="btn btn-accent" onClick={connect}>Connect Wallet</button>
+            <button className="btn btn-accent" onClick={() => setWalletModal(true)}>Connect Wallet</button>
           )}
         </div>
       </div>
@@ -173,7 +251,7 @@ export default function App(){
       <div className="grid">
         <div className="card">
           <h2>Lock Tokens</h2>
-          <p className="muted">Lock ERC‑20 tokens for a fixed time. Only the depositing wallet can withdraw after unlock.</p>
+          <p className="muted">Lock ERC-20 tokens for a fixed time. Only the depositing wallet can withdraw after unlock.</p>
           <div className="hr" />
           <div>
             <label>Token address</label>
@@ -192,7 +270,8 @@ export default function App(){
             </div>
           </div>
           <div className="warn" style={{marginTop:12}}>
-            <strong>Heads‑up:</strong> You must include <span className="mono">{FIXED_FEE_ETH} ETH</span> with the lock transaction. Funds are escrowed in the contract; only the same wallet can withdraw. If you lose keys, funds are **lost**.
+            <strong>Heads-up:</strong> You must include <span className="mono">{FIXED_FEE_ETH} ETH</span> with the lock transaction.
+            Funds are escrowed in the contract; only the same wallet can withdraw. If you lose keys, funds are <strong>lost</strong>.
           </div>
           <div style={{display:'flex', gap:10, marginTop:12}}>
             <button className="btn btn-ghost" onClick={()=>setModal(true)} disabled={!account || !networkOk || !token || !amount || pending}>LOCK TOKENS</button>
@@ -229,6 +308,26 @@ export default function App(){
         </div>
       </div>
 
+      {/* Wallet picker */}
+      {walletModal && (
+        <div className="modal" onClick={()=>setWalletModal(false)}>
+          <div className="card" onClick={e=>e.stopPropagation()}>
+            <h3>Choose a wallet</h3>
+            <div className="hr" />
+            <div className="grid">
+              <button className="btn btn-ghost" onClick={connectAGW}>Abstract Global Wallet</button>
+              <button className="btn btn-ghost" onClick={()=>connectInjected('metamask')}>MetaMask</button>
+              <button className="btn btn-ghost" onClick={()=>connectInjected('rabby')}>Rabby</button>
+              <button className="btn btn-ghost" onClick={()=>connectInjected('phantom')}>Phantom (EVM)</button>
+            </div>
+            <p className="muted" style={{marginTop:12}}>
+              If multiple injected wallets exist, the picker will use EIP-6963 discovery.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Confirm modal */}
       {modal && (
         <div className="modal" onClick={()=>!pending && setModal(false)}>
           <div className="card" onClick={e=>e.stopPropagation()}>
@@ -239,7 +338,7 @@ export default function App(){
               <li>Tokens will be transferred to a smart contract escrow on <strong>Abstract</strong>.</li>
               <li><strong>Only</strong> the same wallet that deposits can withdraw after the timer ends.</li>
               <li>If you lose access to your keys, <strong>funds are lost</strong>.</li>
-              <li>You must include <span className="mono">{FIXED_FEE_ETH} ETH</span> in the transaction (non‑refundable).</li>
+              <li>You must include <span className="mono">{FIXED_FEE_ETH} ETH</span> in the transaction (non-refundable).</li>
             </ul>
             <div className="row" style={{justifyContent:'flex-end', marginTop:12}}>
               <button className="btn btn-ghost" disabled={pending} onClick={()=>setModal(false)}>Cancel</button>
