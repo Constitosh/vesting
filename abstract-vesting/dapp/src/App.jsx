@@ -1,7 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { BrowserProvider, Contract, formatUnits, parseUnits } from 'ethers';
 import detectProvider from '@metamask/detect-provider';
-import { useAgw, useAgwAccount } from '@abstract-foundation/agw-react';
 import abi from './abi/VestiLock.abi.json';
 
 // === CONFIG ===
@@ -11,39 +10,12 @@ const DURATIONS = [30,60,90,120,180,210,240,270,300,330,360];
 const FIXED_FEE_ETH = '0.015';
 const CONTRACT_ADDRESS = import.meta.env.VITE_VESTI_ADDRESS || '0xYourDeployedContract';
 
-// ---------- helpers (self-contained) ----------
-async function discoverInjectedProviders() {
-  const out = [];
+/* ---------------- helpers ---------------- */
 
-  // Phantom (EVM)
-  if (typeof window !== 'undefined' && window.phantom?.ethereum) {
-    out.push({ id: 'phantom', name: 'Phantom', provider: window.phantom.ethereum });
-  }
-
-  // EIP-6963 multi-injected array
-  const addIfKnown = (prov) => {
-    try {
-      if (!prov) return;
-      if (prov.isRabby) out.push({ id: 'rabby', name: 'Rabby', provider: prov });
-      if (prov.isMetaMask) out.push({ id: 'metamask', name: 'MetaMask', provider: prov });
-    } catch {}
-  };
-
-  const agg = window?.ethereum?.providers;
-  if (Array.isArray(agg)) agg.forEach(addIfKnown);
-  else addIfKnown(window?.ethereum);
-
-  try {
-    const mm = await detectProvider({ silent: true });
-    if (mm && !out.find(x => x.provider === mm)) addIfKnown(mm);
-  } catch {}
-
-  // de-dup
-  return out.filter((x, i, a) => a.findIndex(y => y.provider === x.provider) === i);
-}
+function hexChain(id){ return '0x' + Number(id).toString(16); }
 
 async function ensureAbstractChain(provider, chainId = CHAIN_ID, rpcUrl = RPC_URL) {
-  const wantHex = '0x' + chainId.toString(16);
+  const wantHex = hexChain(chainId);
   let current = await provider.request({ method: 'eth_chainId' }).catch(() => null);
   if (!current || current.toLowerCase() !== wantHex.toLowerCase()) {
     try {
@@ -61,7 +33,7 @@ async function ensureAbstractChain(provider, chainId = CHAIN_ID, rpcUrl = RPC_UR
       });
     }
   }
-  current = await provider.request({ method: 'eth_chainId' });
+  current = await provider.request({ method: 'eth_chainId' }).catch(() => null);
   return current?.toLowerCase() === wantHex.toLowerCase();
 }
 
@@ -72,10 +44,49 @@ async function wrapEthersFrom(provider) {
   return { ethersProvider: bp, signer, account: accounts?.[0] || (await signer.getAddress()) };
 }
 
-// ----------------------------------------------
+// Try to find injected EIP-1193 providers, including AGW, MetaMask, Rabby, Phantom (EVM)
+async function discoverInjectedProviders() {
+  const out = [];
+
+  // New multi-injected standard (EIP-6963)
+  const addIfKnown = (prov) => {
+    try {
+      if (!prov) return;
+      if (prov.isRabby) out.push({ id: 'rabby', name: 'Rabby', provider: prov });
+      if (prov.isMetaMask) out.push({ id: 'metamask', name: 'MetaMask', provider: prov });
+      // Generic entry if neither flag present (could be AGW or other EVM wallet)
+      if (!prov.isRabby && !prov.isMetaMask) out.push({ id: 'injected', name: 'Injected Wallet', provider: prov });
+    } catch {}
+  };
+
+  const agg = window?.ethereum?.providers;
+  if (Array.isArray(agg)) agg.forEach(addIfKnown);
+  else addIfKnown(window?.ethereum);
+
+  // Phantom (EVM)
+  if (typeof window !== 'undefined' && window.phantom?.ethereum) {
+    out.push({ id: 'phantom', name: 'Phantom', provider: window.phantom.ethereum });
+  }
+
+  // Common AGW injections (covering current/older builds just in case)
+  if (window?.agw?.ethereum) out.push({ id: 'agw', name: 'Abstract Global Wallet', provider: window.agw.ethereum });
+  if (window?.abstract?.ethereum) out.push({ id: 'agw', name: 'Abstract Global Wallet', provider: window.abstract.ethereum });
+  if (window?.abstractWallet?.provider) out.push({ id: 'agw', name: 'Abstract Global Wallet', provider: window.abstractWallet.provider });
+
+  // Fallback MetaMask detect
+  try {
+    const mm = await detectProvider({ silent: true });
+    if (mm && !out.find(x => x.provider === mm)) addIfKnown(mm);
+  } catch {}
+
+  // Deduplicate by provider object
+  return out.filter((x, i, a) => a.findIndex(y => y.provider === x.provider) === i);
+}
+
+/* --------------- component --------------- */
 
 export default function App(){
-  // Wallet state
+  // Wallet connection state
   const [account, setAccount] = useState(null);
   const [ethersProvider, setEthersProvider] = useState(null);
   const [signer, setSigner] = useState(null);
@@ -88,67 +99,56 @@ export default function App(){
   const [amount, setAmount] = useState('');
   const [days, setDays] = useState(30);
   const [pending, setPending] = useState(false);
-  const [modal, setModal] = useState(false);
+  const [confirmModal, setConfirmModal] = useState(false);
   const [walletModal, setWalletModal] = useState(false);
+  const [providers, setProviders] = useState([]);
   const [positions, setPositions] = useState([]);
 
-  // AGW hooks
-  const agw = useAgw();
-  const { address: agwAddress } = useAgwAccount();
-
-  // Contract
+  // Build contract instance from current provider
   const vest = useMemo(() => {
     if (!ethersProvider) return null;
     return new Contract(CONTRACT_ADDRESS, abi, ethersProvider);
   }, [ethersProvider]);
 
-  // ---- Connect flows ----
-  const openWalletModal = () => setWalletModal(true);
-
-  const connectAGW = async () => {
-    try {
-      await agw.connect();                 // opens AGW flow
-      const eip1193 = await agw.getProvider(); // AGW provider
-      const ok = await ensureAbstractChain(eip1193);
-      if (!ok) throw new Error('Failed to switch/add Abstract');
-      const { ethersProvider, signer, account } = await wrapEthersFrom(eip1193);
-      setAccount(account);
-      setEthersProvider(ethersProvider);
-      setSigner(signer);
-      setNetworkOk(true);
-      setWalletModal(false);
-    } catch (e) {
-      alert(e?.message || 'AGW connect failed');
-    }
-  };
-
-  const connectInjected = async (id) => {
-    try {
+  // Populate wallet choices on first open
+  useEffect(() => {
+    if (!walletModal) return;
+    (async () => {
       const list = await discoverInjectedProviders();
-      const use = id ? list.find(x => x.id === id) : list[0];
-      if (!use) throw new Error('No injected wallet found');
-      const ok = await ensureAbstractChain(use.provider);
-      if (!ok) throw new Error('Failed to switch/add Abstract');
-      const { ethersProvider, signer, account } = await wrapEthersFrom(use.provider);
+      // Ensure we have at least a generic option if nothing detected
+      setProviders(list.length ? list : []);
+    })();
+  }, [walletModal]);
+
+  // Connect flows
+  const connectVia = async (entry) => {
+    try {
+      if (!entry?.provider) throw new Error('No wallet provider found');
+      // Ask for accounts first; some wallets require it before chain methods
+      await entry.provider.request?.({ method: 'eth_requestAccounts' });
+      const ok = await ensureAbstractChain(entry.provider);
+      if (!ok) throw new Error('Failed to switch/add Abstract chain');
+      const { ethersProvider, signer, account } = await wrapEthersFrom(entry.provider);
       setAccount(account);
       setEthersProvider(ethersProvider);
       setSigner(signer);
       setNetworkOk(true);
       setWalletModal(false);
     } catch (e) {
-      alert(e?.message || 'Connect failed');
+      alert(e?.message || 'Wallet connect failed');
     }
   };
 
-  const disconnect = async () => {
-    try { await agw.disconnect?.(); } catch {}
+  const disconnect = () => {
+    // Injected wallets don’t have a programmatic disconnect. Clear local state.
     setAccount(null);
     setSigner(null);
     setEthersProvider(null);
     setNetworkOk(false);
+    setPositions([]);
   };
 
-  // ---- Token meta on address change ----
+  // Token metadata
   useEffect(() => {
     (async ()=>{
       if (!ethersProvider || !token || token.length !== 42) return;
@@ -166,7 +166,7 @@ export default function App(){
     })();
   }, [ethersProvider, token]);
 
-  // ---- Load recent positions for connected account ----
+  // Load recent positions by this account
   useEffect(() => {
     if (!vest || !account) return;
     const filter = vest.filters.Deposit(null, account);
@@ -183,7 +183,7 @@ export default function App(){
     })();
   }, [vest, account]);
 
-  // ---- Lock / Withdraw ----
+  // Ensure allowance then lock
   const ensureAllowance = async (erc20, needed) => {
     const allowance = await erc20.allowance(account, CONTRACT_ADDRESS);
     if (allowance >= needed) return;
@@ -198,13 +198,13 @@ export default function App(){
       'function approve(address spender, uint256 value) returns (bool)'
     ], ethersProvider);
 
-    const amt = parseUnits(amount || '0', decimals);
+    const amt = parseUnits((amount || '0').toString(), decimals);
     setPending(true);
     try {
       await ensureAllowance(erc20, amt);
       const vestW = vest.connect(signer);
       const tx = await vestW.lock(token, amt, days, { value: parseUnits(FIXED_FEE_ETH, 18) });
-      setModal(false);
+      setConfirmModal(false);
       await tx.wait();
     } catch (e) {
       alert(e?.shortMessage || e?.message || 'Transaction failed');
@@ -270,10 +270,11 @@ export default function App(){
             </div>
           </div>
           <div className="warn" style={{marginTop:12}}>
-            <strong>Heads-up:</strong> You must include <span className="mono">{FIXED_FEE_ETH} ETH</span> with the lock transaction. Funds are escrowed in the contract; only the same wallet can withdraw. If you lose keys, funds are <strong>lost</strong>.
+            <strong>Heads-up:</strong> You must include <span className="mono">{FIXED_FEE_ETH} ETH</span> with the lock transaction.
+            Funds are escrowed in the contract; only the same wallet can withdraw. If you lose keys, funds are <strong>lost</strong>.
           </div>
           <div style={{display:'flex', gap:10, marginTop:12}}>
-            <button className="btn btn-ghost" onClick={()=>setModal(true)} disabled={!account || !networkOk || !token || !amount || pending}>LOCK TOKENS</button>
+            <button className="btn btn-ghost" onClick={()=>setConfirmModal(true)} disabled={!account || !networkOk || !token || !amount || pending}>LOCK TOKENS</button>
           </div>
         </div>
 
@@ -314,21 +315,21 @@ export default function App(){
             <h3>Choose a wallet</h3>
             <div className="hr" />
             <div className="grid">
-              <button className="btn btn-ghost" onClick={connectAGW}>Abstract Global Wallet</button>
-              <button className="btn btn-ghost" onClick={()=>connectInjected('metamask')}>MetaMask</button>
-              <button className="btn btn-ghost" onClick={()=>connectInjected('rabby')}>Rabby</button>
-              <button className="btn btn-ghost" onClick={()=>connectInjected('phantom')}>Phantom (EVM)</button>
+              {providers.length === 0 && <div className="muted">No wallets detected in this browser.</div>}
+              {providers.map((p, i) => (
+                <button key={i} className="btn btn-ghost" onClick={()=>connectVia(p)}>{p.name}</button>
+              ))}
             </div>
             <p className="muted" style={{marginTop:12}}>
-              If multiple injected wallets exist, the picker will use EIP-6963 discovery.
+              Supports injected wallets (MetaMask, Rabby, Phantom EVM, AGW if injected). We’ll auto-switch to Abstract (2741).
             </p>
           </div>
         </div>
       )}
 
       {/* Confirm modal */}
-      {modal && (
-        <div className="modal" onClick={()=>!pending && setModal(false)}>
+      {confirmModal && (
+        <div className="modal" onClick={()=>!pending && setConfirmModal(false)}>
           <div className="card" onClick={e=>e.stopPropagation()}>
             <h3>Confirm Lock</h3>
             <p className="muted">Read carefully before proceeding.</p>
@@ -340,7 +341,7 @@ export default function App(){
               <li>You must include <span className="mono">{FIXED_FEE_ETH} ETH</span> in the transaction (non-refundable).</li>
             </ul>
             <div className="row" style={{justifyContent:'flex-end', marginTop:12}}>
-              <button className="btn btn-ghost" disabled={pending} onClick={()=>setModal(false)}>Cancel</button>
+              <button className="btn btn-ghost" disabled={pending} onClick={()=>setConfirmModal(false)}>Cancel</button>
               <button className="btn btn-accent" disabled={pending} onClick={onLock}>{pending? 'Working…':'I Understand, Lock Now'}</button>
             </div>
           </div>
@@ -348,7 +349,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24}} className="muted">
-         <div>Made by<a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
+        <div>Made by<a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
       </div>
     </div>
   );
