@@ -93,8 +93,8 @@ export default function App(){
   const [amount, setAmount] = useState('');
   const [days, setDays] = useState(30);
 
-  // Alchemy balances
-  const [detected, setDetected] = useState([]); // [{address,symbol,decimals,balanceRaw}]
+  // Alchemy balances (with metadata)
+  const [detected, setDetected] = useState([]); // [{address,symbol,decimals,balanceRaw,name?,logo?}]
   const [selectedIdx, setSelectedIdx] = useState(-1);
   const [loadingTokens, setLoadingTokens] = useState(false);
   const [includeZero, setIncludeZero] = useState(false);
@@ -115,13 +115,12 @@ export default function App(){
       }
       const prov = AGW_ONLY();
       if (!prov) {
-        console.warn('AGW provider not found in window.* (abstract/agw)');
+        console.warn('AGW provider not found in window.abstract/agw/abstractWallet');
         return;
       }
       try { await prov.request({ method: 'eth_requestAccounts' }); } catch {}
       const ok = await ensureAbstractChain(prov);
       const { ethersProvider, signer, account } = await wrapEthers(prov);
-
       setNetworkOk(ok);
       setAccount(account);
       setSigner(signer);
@@ -142,62 +141,77 @@ export default function App(){
     })();
   }, [isConnected, address]);
 
-  // Fetch ERC-20 balances from Alchemy once we have AGW provider, account, and correct chain
-  const loadAlchemyTokens = async (addr) => {
+  // --- Alchemy: balances + metadata (no on-chain meta calls) ---
+  async function loadAlchemyTokensWithMeta(walletAddress) {
     setLoadingTokens(true);
     setLastAlchemyErr(null);
     try {
-      const body = {
-        id: 1,
-        jsonrpc: "2.0",
-        method: "alchemy_getTokenBalances",
-        params: [addr, "erc20"]
+      // 1) balances
+      const balancesBody = {
+        id: 1, jsonrpc: "2.0", method: "alchemy_getTokenBalances",
+        params: [walletAddress, "erc20"]
       };
-      const res = await fetch(ALCHEMY_URL, {
-        method: 'POST',
-        headers: { 'Accept':'application/json', 'Content-Type':'application/json' },
-        body: JSON.stringify(body)
+      const balancesRes = await fetch(ALCHEMY_URL, {
+        method: "POST",
+        headers: { "Accept": "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify(balancesBody),
       });
-      const json = await res.json();
+      const balancesJson = await balancesRes.json();
+      const rows = Array.isArray(balancesJson?.result?.tokenBalances)
+        ? balancesJson.result.tokenBalances
+        : [];
 
-      if (!json?.result) {
+      // 2) normalize + filter
+      const items = rows
+        .map(r => ({
+          address: r.contractAddress,
+          balanceRaw: hexToBigIntSafe(r.tokenBalance || "0x0"),
+        }))
+        .filter(t => includeZero ? true : t.balanceRaw > 0n)
+        .slice(0, 200);
+
+      if (items.length === 0) {
         setDetected([]); setSelectedIdx(-1);
-        setLastAlchemyErr(JSON.stringify(json));
         return;
       }
 
-      const balances = Array.isArray(json.result.tokenBalances) ? json.result.tokenBalances : [];
-      let items = balances.map((row) => ({
-        address: row.contractAddress,
-        balanceRaw: hexToBigIntSafe(row.tokenBalance),
-        symbol: 'TOK',
-        decimals: 18
-      }));
+      // 3) metadata (Alchemy per-token)
+      const metaFor = async (ca) => {
+        const metaBody = {
+          id: 1, jsonrpc: "2.0", method: "alchemy_getTokenMetadata",
+          params: [ca],
+        };
+        const metaRes = await fetch(ALCHEMY_URL, {
+          method: "POST",
+          headers: { "Accept": "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify(metaBody),
+        });
+        const metaJson = await metaRes.json();
+        const m = metaJson?.result || {};
+        return {
+          symbol: typeof m.symbol === "string" && m.symbol.length ? m.symbol : "TOK",
+          decimals: Number.isFinite(m.decimals) ? Number(m.decimals) : 18,
+          name: typeof m.name === "string" ? m.name : undefined,
+          logo: m.logo || null,
+        };
+      };
 
-      if (!includeZero) items = items.filter(t => t.balanceRaw > 0n);
-      if (items.length === 0) { setDetected([]); setSelectedIdx(-1); return; }
-
-      // Enrich meta from chain
-      const metaAbi = [
-        'function decimals() view returns (uint8)',
-        'function symbol() view returns (string)'
-      ];
-      const enriched = await Promise.all(items.slice(0, 250).map(async (t) => {
+      const enriched = [];
+      for (const t of items) {
         try {
-          const c = new Contract(t.address, metaAbi, ethersProvider);
-          const [d, s] = await Promise.all([
-            c.decimals().catch(()=>18),
-            c.symbol().catch(()=> 'TOK')
-          ]);
-          return { ...t, symbol: s, decimals: Number(d) };
-        } catch { return t; }
-      }));
+          const m = await metaFor(t.address);
+          enriched.push({ ...t, ...m });
+        } catch {
+          enriched.push({ ...t, symbol: "TOK", decimals: 18 });
+        }
+      }
 
+      // 4) sort desc by balance
       enriched.sort((a,b) => (b.balanceRaw > a.balanceRaw ? 1 : -1));
-      setDetected(enriched);
 
+      setDetected(enriched);
       if (enriched.length) {
-        setTokenMode('dropdown');
+        setTokenMode("dropdown");
         setSelectedIdx(0);
         setTokenAddr(enriched[0].address);
         setSymbol(enriched[0].symbol);
@@ -206,25 +220,22 @@ export default function App(){
         setSelectedIdx(-1);
       }
     } catch (e) {
+      console.error("Alchemy fetch error", e);
       setLastAlchemyErr(e?.message || String(e));
       setDetected([]); setSelectedIdx(-1);
-      console.error('Alchemy fetch error', e);
     } finally {
       setLoadingTokens(false);
     }
-  };
+  }
 
-  // Load tokens when everything is ready AND we are on Abstract mainnet
+  // Load tokens as soon as we know the account (no chain requirement for reading via Alchemy)
   useEffect(() => {
-    const onAbstract = connectedChainId === CHAIN_ID;
-    if (!ethersProvider || !account || !networkOk || !onAbstract) {
-      setDetected([]); setSelectedIdx(-1);
-      return;
-    }
-    loadAlchemyTokens(account);
-  }, [ethersProvider, account, networkOk, includeZero, connectedChainId]);
+    if (!account) { setDetected([]); setSelectedIdx(-1); return; }
+    loadAlchemyTokensWithMeta(account);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [account, includeZero, ALCHEMY_URL]);
 
-  // Keep token meta when selection/custom changes
+  // Keep token meta when selection/custom changes (dropdown already has meta; custom fetch on-chain)
   useEffect(() => {
     (async ()=>{
       if (!ethersProvider) return;
@@ -279,6 +290,7 @@ export default function App(){
 
   const onLock = async () => {
     if (!signer) return alert('Connect the Abstract Wallet first');
+    if (connectedChainId !== CHAIN_ID) return alert('Switch to Abstract (2741) to lock.');
     const tokenToUse = tokenAddr;
     if (!tokenToUse || tokenToUse.length !== 42) return alert('Choose a token (or paste a valid address).');
 
@@ -304,6 +316,7 @@ export default function App(){
 
   const withdraw = async (id) => {
     if (!signer) return;
+    if (connectedChainId !== CHAIN_ID) return alert('Switch to Abstract (2741) to withdraw.');
     setPending(true);
     try {
       const vestW = vest.connect(signer);
@@ -382,7 +395,6 @@ export default function App(){
                   <select
                     value={String(selectedIdx)}
                     onChange={(e)=>setSelectedIdx(Number(e.target.value))}
-                    disabled={!isOnAbstract}
                   >
                     {(!loadingTokens && detected.length === 0) && <option value="-1">— none detected —</option>}
                     {detected.map((t, i) => (
@@ -393,7 +405,7 @@ export default function App(){
                   </select>
                 </div>
                 <div className="row" style={{gap:10, flex: '1 1 220px'}}>
-                  <button className="btn btn-ghost" onClick={()=>account && loadAlchemyTokens(account)} disabled={!account || loadingTokens || !isOnAbstract}>Reload tokens</button>
+                  <button className="btn btn-ghost" onClick={()=>account && loadAlchemyTokensWithMeta(account)} disabled={!account || loadingTokens}>Reload tokens</button>
                   <label className="muted" style={{display:'flex', alignItems:'center', gap:6}}>
                     <input type="checkbox" checked={includeZero} onChange={e=>setIncludeZero(e.target.checked)} />
                     Include zero balances
@@ -438,7 +450,7 @@ export default function App(){
             <button
               className="btn btn-ghost"
               onClick={()=>setConfirmModal(true)}
-              disabled={!isConnected || !networkOk || !isOnAbstract || pending ||
+              disabled={!isConnected || connectedChainId !== CHAIN_ID || !networkOk || pending ||
                         (tokenMode==='dropdown' && (selectedIdx<0 || !detected[selectedIdx])) ||
                         (tokenMode==='custom' && (!tokenAddr || tokenAddr.length!==42)) ||
                         !amount}
