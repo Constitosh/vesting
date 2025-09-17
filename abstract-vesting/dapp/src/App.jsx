@@ -501,7 +501,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24}} className="muted">
-        <div>Network: Abstract (chainId 2741). Explorer: <a href="https://abscan.org/" target="_blank">abscan.org</a></div>
+ <div>Made by <a href="https://x.com/totally_abs" target="_blank">The tABS Laboratory Team</a> 2025</div>
       </div>
     </div>
   );
