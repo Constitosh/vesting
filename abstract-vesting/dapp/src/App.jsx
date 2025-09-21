@@ -48,6 +48,49 @@ function getInjected(){
   return window.abstract?.ethereum || window.agw?.ethereum || window.abstractWallet?.provider || window.ethereum || null;
 }
 
+/* ========= NEW: full-range, chunked event scan =========
+   Reads Deposit events for a single user across the whole chain history.
+   No redeploy needed. Works even when the tx is older than 50k blocks. */
+async function fetchUserDeposits(vestEthers, provider, user, fromBlock = 0, toBlock = 'latest') {
+  const CHUNK = 40000; // adjust if RPC allows larger windows
+  const latest = (toBlock === 'latest')
+    ? await provider.getBlockNumber()
+    : toBlock;
+
+  const events = [];
+  for (let start = fromBlock; start <= latest; start += CHUNK + 1) {
+    const end = Math.min(start + CHUNK, latest);
+
+    // Get ALL Deposit events and filter in JS (robust to arg order)
+    const logs = await vestEthers.queryFilter(vestEthers.filters.Deposit?.() ?? {}, start, end);
+
+    for (const l of logs) {
+      const a = l.args || {};
+
+      // Try to pick depositor robustly (by name or index)
+      const depositor =
+        a.depositor ??           // named field
+        a[1] ??                  // guess index 1
+        a[0];                    // fallback
+
+      if (!depositor) continue;
+      if (String(depositor).toLowerCase() !== user.toLowerCase()) continue;
+
+      // Extract the rest robustly
+      const id = (a.id ?? a[0])?.toString?.() || l.args?.[0]?.toString?.();
+      const token = a.token ?? a[2] ?? a[0]; // try named, then fallback
+      const amount = a.amount ?? a[3] ?? a[1];
+      const unlockAt = Number(a.unlockAt ?? a[4]);
+
+      if (!id || !token || !amount || !unlockAt) continue;
+      events.push({ id, token, amount, unlockAt });
+    }
+  }
+  // newest first
+  events.sort((x, y) => (y.unlockAt - x.unlockAt));
+  return events;
+}
+
 export default function App(){
   const isNarrow = useIsNarrow();
 
@@ -158,7 +201,7 @@ export default function App(){
     setDecimals(Number.isFinite(t.decimals)?t.decimals:18);
   },[tokenMode, selectedIdx, detected]);
 
-  // ---- Positions (read-only) ----
+  // ---- Positions (READ via ethers, full-range scan) ----
   const vestReadEthers = useMemo(()=>{
     if(!ethersProvider) return null;
     return new EthersContract(CONTRACT_ADDRESS, abi, ethersProvider);
@@ -166,22 +209,19 @@ export default function App(){
 
   useEffect(()=>{
     (async ()=>{
-      if(!vestReadEthers || !wagmiAddr) return;
+      if(!vestReadEthers || !wagmiAddr || !ethersProvider) return;
       try{
-        const filter = vestReadEthers.filters?.Deposit?.(null, wagmiAddr) || { address: CONTRACT_ADDRESS, topics: [] };
-        const logs = await vestReadEthers.queryFilter(filter, -50000, 'latest');
-        const items = await Promise.all(logs.slice(-20).map(async (l)=>{
-          const id = l.args.id.toString();
-          const pos = await vestReadEthers.getPosition(id);
-          return { id, token: pos.token, amount: pos.amount, unlockAt: Number(pos.unlockAt) };
-        }));
-        setPositions(items.reverse());
-      }catch{}
+        // If you know the contract deployment block, set it instead of 0 for speed.
+        const items = await fetchUserDeposits(vestReadEthers, ethersProvider, wagmiAddr, 0, 'latest');
+        setPositions(items);
+      }catch(e){
+        console.warn('positions scan failed:', e);
+        setPositions([]);
+      }
     })();
-  },[vestReadEthers, wagmiAddr]);
+  },[vestReadEthers, wagmiAddr, ethersProvider]);
 
   // ---- Actions via viem walletClient (preferred) or injected ethers (fallback) ----
-
   async function approveIfNeeded_v(erc20, owner, spender, amount){
     const allowance = await publicClient.readContract({ address: erc20, abi: ERC20_ABI, functionName: 'allowance', args:[owner, spender] });
     if (allowance >= amount) return;
@@ -189,8 +229,6 @@ export default function App(){
   }
 
   async function lock_v(){
-    if(!walletClient || !publicClient) throw new Error('Wallet session not ready. Tap Connect first.');
-    if(!wagmiAddr) throw new Error('No wallet address.');
     const ca = getAddress(tokenAddr);
     const amt = viemParseUnits(String(amount||'0'), decimals);
     await approveIfNeeded_v(ca, wagmiAddr, getAddress(CONTRACT_ADDRESS), amt);
@@ -206,7 +244,6 @@ export default function App(){
   }
 
   async function withdraw_v(id){
-    if(!walletClient) throw new Error('Wallet session not ready.');
     await walletClient.writeContract({
       address: getAddress(CONTRACT_ADDRESS),
       abi,
@@ -258,6 +295,11 @@ export default function App(){
         await lock_fallback();
       }
       setConfirmModal(false);
+      // refresh positions after a successful lock
+      if (vestReadEthers && wagmiAddr && ethersProvider) {
+        const items = await fetchUserDeposits(vestReadEthers, ethersProvider, wagmiAddr, 0, 'latest');
+        setPositions(items);
+      }
     }catch(e){
       alert(e?.shortMessage || e?.message || 'Transaction failed');
     }finally{ setPending(false); }
@@ -294,7 +336,6 @@ export default function App(){
       <div className="nav">
         <div className="brand">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="#62f3a7" strokeWidth="2"/><path d="M7 13l3 3 7-7" stroke="#62f3a7" strokeWidth="2"/></svg>
-        {/* brand */}
           <span>The tABS VestiLock</span>
           <span className="pill">Abstract · Mainnet</span>
         </div>
@@ -457,15 +498,7 @@ export default function App(){
             </ul>
             <div className="row" style={{justifyContent:'flex-end',marginTop:12}}>
               <button className="btn btn-ghost" disabled={pending} onClick={()=>setConfirmModal(false)}>Cancel</button>
-              <button className="btn btn-accent" disabled={pending} onClick={async ()=>{
-                setPending(true);
-                try{
-                  if (walletClient) await lock_v();
-                  else await lock_fallback(); // desktop/MM fallback only
-                  setConfirmModal(false);
-                }catch(e){ alert(e?.shortMessage || e?.message || 'Transaction failed'); }
-                finally{ setPending(false); }
-              }}>{pending?'Working…':'I Understand, Lock Now'}</button>
+              <button className="btn btn-accent" disabled={pending} onClick={onLock}>{pending?'Working…':'I Understand, Lock Now'}</button>
             </div>
           </div>
         </div>
